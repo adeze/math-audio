@@ -1902,7 +1902,7 @@ dependencies = [
 
 [[package]]
 name = "math-iir-fir"
-version = "0.5.22"
+version = "0.5.23"
 dependencies = [
  "base64 0.22.1",
  "byteorder",
@@ -1919,7 +1919,7 @@ dependencies = [
 
 [[package]]
 name = "math-optimisation"
-version = "0.5.13"
+version = "0.5.14"
 dependencies = [
  "clap",
  "criterion",
