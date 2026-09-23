@@ -34,6 +34,7 @@ pub mod response;
 pub mod rtpghi;
 pub mod signals;
 pub mod simd;
+pub mod spatial_evaluation;
 pub mod stft;
 pub mod tonal_transient;
 pub mod waveform;
