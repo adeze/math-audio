@@ -1,0 +1,14 @@
+version = 1
+name = "math-audio"
+
+[setup]
+script = ""
+
+[[actions]]
+name = "update-dependencies"
+icon = "tool"
+command = '''
+set -euo pipefail
+cargo update
+cargo check --workspace --locked
+'''
