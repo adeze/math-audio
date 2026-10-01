@@ -33,7 +33,7 @@ where
         }
         // Linear penalties: lb <= A x <= ub
         if let Some(lp) = &self.config.linear_penalty {
-            let ax = matvec(&lp.a, &x.to_owned());
+            let ax = matvec(&lp.a, x);
             Zip::from(&ax)
                 .and(&lp.lb)
                 .and(&lp.ub)

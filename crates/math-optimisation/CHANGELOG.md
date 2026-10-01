@@ -1,3 +1,7 @@
+# Unreleased
+
+- Borrow the existing parameter vector for linear-penalty matrix multiplication instead of cloning it on every scalar objective evaluation. Preserve exact penalty results and input contents; no solver defaults change.
+
 # 0.5.14
 
 ## Bug fixes

@@ -571,6 +571,49 @@ mod constraint_and_penalty_tests {
     use super::*;
 
     #[test]
+    fn borrowed_linear_penalty_matches_owned_reference() {
+        let sphere = |x: &Array1<f64>| x.dot(x);
+        let mut de =
+            DifferentialEvolution::new(&sphere, array![-5.0, -5.0], array![5.0, 5.0]).unwrap();
+        de.config_mut().linear_penalty = Some(crate::LinearPenalty {
+            a: ndarray::arr2(&[[1.0, -2.0], [0.0, 1.0]]),
+            lb: array![-1.0, -0.5],
+            ub: array![1.0, 0.5],
+            weight: 3.0,
+        });
+        let lp = de.config_mut().linear_penalty.clone().unwrap();
+        for x in [
+            array![0.0, 0.0],
+            array![3.0, 2.0],
+            array![-3.0, -2.0],
+            array![1.0, 0.5],
+            array![3.0, 0.0],
+            array![-3.0, 0.0],
+            array![3.0, 99.0, 2.0, 99.0].slice_move(ndarray::s![..;2]),
+        ] {
+            let original = x.clone();
+            let ax = oxiblas_ndarray::blas::matvec(&lp.a, &x.to_owned());
+            let expected: f64 = ax
+                .iter()
+                .zip(lp.lb.iter())
+                .zip(lp.ub.iter())
+                .map(|((&v, &lo), &hi)| {
+                    let violation = if v < lo {
+                        lo - v
+                    } else if v > hi {
+                        v - hi
+                    } else {
+                        0.0
+                    };
+                    lp.weight * violation * violation
+                })
+                .sum();
+            assert_eq!(de.penalty(&x).to_bits(), expected.to_bits());
+            assert_eq!(x, original);
+        }
+    }
+
+    #[test]
     fn test_inequality_penalty() {
         let sphere = |x: &Array1<f64>| x.iter().map(|&xi| xi * xi).sum::<f64>();
         let config = DEConfigBuilder::new()
