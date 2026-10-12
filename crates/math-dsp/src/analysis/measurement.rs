@@ -11,10 +11,6 @@ use super::estimate::estimate_noise_floor_db_from_silence;
 use super::plan::deconvolve_sweep;
 use super::plan::plan_fft_forward;
 use super::plan::plan_fft_inverse;
-use crate::capture_tdoa::MAX_PLAUSIBLE_SKEW_PPM;
-use crate::capture_tdoa::MIN_TDOA_CONFIDENCE_DB;
-use crate::capture_tdoa::TdoaConfig;
-use crate::capture_tdoa::estimate_chirp_tdoa;
 use super::types::AveragedEssResponse;
 use super::types::AveragedResponse;
 use super::types::ClippingInfo;
@@ -23,6 +19,10 @@ use super::types::EssAnalysisResult;
 use super::types::LagEstimate;
 use super::types::MeasurementQualityConfig;
 use super::types::MeasurementQualityReport;
+use crate::capture_tdoa::MAX_PLAUSIBLE_SKEW_PPM;
+use crate::capture_tdoa::MIN_TDOA_CONFIDENCE_DB;
+use crate::capture_tdoa::TdoaConfig;
+use crate::capture_tdoa::estimate_chirp_tdoa;
 use rustfft::num_complex::Complex;
 
 fn active_signal_span(signal: &[f32]) -> Option<(usize, usize)> {
@@ -822,9 +822,7 @@ pub fn estimate_clock_drift(
         return Err("estimate_clock_drift: sample rate must be greater than zero".to_string());
     }
     if !chirp_spacing_samples.is_finite() || chirp_spacing_samples <= 0.0 {
-        return Err(
-            "estimate_clock_drift: chirp spacing must be positive and finite".to_string(),
-        );
+        return Err("estimate_clock_drift: chirp spacing must be positive and finite".to_string());
     }
     if expected_end_samples <= expected_start_samples
         || expected_start_samples >= recording.len()
@@ -866,7 +864,10 @@ pub fn estimate_clock_drift(
                 "estimate_clock_drift: {label} timing chirp is missing, ambiguous, or too weak"
             ));
         }
-        Ok((start as f64 + estimate.offset_samples, estimate.confidence_db))
+        Ok((
+            start as f64 + estimate.offset_samples,
+            estimate.confidence_db,
+        ))
     };
     let (start_pos, start_db) = locate(expected_start_samples, "start")?;
     let (end_pos, end_db) = locate(expected_end_samples, "end")?;
@@ -886,8 +887,7 @@ pub fn estimate_clock_drift(
     // to ≈11 dB (rectangular-chirp sidelobes), reading ≈0.9, while
     // marginal ≈7 dB locks read ≈0.17 and fall below the usual 0.2
     // drift-action gate.
-    let confidence =
-        ((start_db.min(end_db) - MIN_TDOA_CONFIDENCE_DB) / 6.0).clamp(0.0, 1.0) as f32;
+    let confidence = ((start_db.min(end_db) - MIN_TDOA_CONFIDENCE_DB) / 6.0).clamp(0.0, 1.0) as f32;
     Ok(ClockDriftEstimate {
         ppm,
         start_lag_samples: start_pos.round() as isize,
