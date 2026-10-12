@@ -1,15 +1,17 @@
 use crate::traits::{FilterFloat, lit};
 
-/// Compute the Bark-scale warping coefficient for a given sample rate.
+/// Compute the Bark-scale warping coefficient for a given sample rate in Hz.
 ///
-/// Formula: λ = 1.0674 * sqrt(2/π * arctan(0.06583 * fs)) - 0.1916
+/// Formula (Smith & Abel 1999): λ = 1.0674 * sqrt(2/π * arctan(0.06583 * fs)) - 0.1916
+/// with the sample rate in kHz; the Hz argument is converted internally.
 ///
-/// At 48 kHz, λ ≈ 0.876, which approximates the Bark frequency scale,
+/// At 48 kHz, λ ≈ 0.766, which approximates the Bark frequency scale,
 /// concentrating filter resolution where human hearing is most sensitive
 /// to room modes (below ~500 Hz).
 pub fn bark_lambda<T: FilterFloat>(sample_rate: T) -> T {
+    let fs_khz = sample_rate / lit::<T>(1000.0);
     let two_over_pi = lit::<T>(2.0) / T::PI();
-    let inner = (lit::<T>(0.06583) * sample_rate).atan();
+    let inner = (lit::<T>(0.06583) * fs_khz).atan();
     lit::<T>(1.0674) * (two_over_pi * inner).sqrt() - lit::<T>(0.1916)
 }
 
@@ -57,15 +59,15 @@ pub fn unwarp_frequency<T: FilterFloat>(warped_hz: T, sample_rate: T, lambda: T)
 ///
 /// Recurrence:
 /// ```text
-/// w      = input − λ·state
-/// output = λ·w + state
+/// w      = input + λ·state
+/// output = state − λ·w
 /// state  ← w
 /// ```
 /// With λ = 0 this reduces to a unit delay: output = state, state ← input.
 #[inline(always)]
 pub(super) fn allpass_step<T: FilterFloat>(input: T, state: &mut T, lambda: T) -> T {
-    let w = input - lambda * *state;
-    let out = lambda * w + *state;
+    let w = input + lambda * *state;
+    let out = *state - lambda * w;
     *state = w;
     out
 }
@@ -73,13 +75,13 @@ pub(super) fn allpass_step<T: FilterFloat>(input: T, state: &mut T, lambda: T) -
 /// Precompute the constants needed for the closed-form implicit-equation solution.
 ///
 /// Returns `(inv_denom, one_minus_lam_sq)` where:
-/// - `inv_denom = 1 / (1 + a1·λ + a2·λ²)` — the denominator of the solved y[n]
+/// - `inv_denom = 1 / (1 − a1·λ + a2·λ²)` — the denominator of the solved y[n]
 /// - `one_minus_lam_sq = 1 − λ²`
 #[inline]
 pub(super) fn compute_implicit_consts<T: FilterFloat>(a1: T, a2: T, lambda: T) -> (T, T) {
     let lambda_sq = lambda * lambda;
     let one_minus_lam_sq = T::one() - lambda_sq;
-    let raw_denom = T::one() + a1 * lambda + a2 * lambda_sq;
+    let raw_denom = T::one() - a1 * lambda + a2 * lambda_sq;
 
     // Issue #3: use a type-aware threshold based on the coefficient scale
     // rather than an absolute 1e-15 that is below f32::EPSILON.

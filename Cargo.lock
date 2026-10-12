@@ -993,7 +993,7 @@ dependencies = [
 
 [[package]]
 name = "math-dsp"
-version = "0.5.32"
+version = "0.5.33"
 dependencies = [
  "approx",
  "clap",
