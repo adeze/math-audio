@@ -242,23 +242,17 @@ fn test_analyze_recording_silent_channel() {
     let wav_path = dir.join("test_silent.wav");
     write_test_wav(&wav_path, &recorded, sample_rate);
 
-    let result = analyze_recording(&wav_path, &reference, sample_rate, None).unwrap();
+    // A disconnected channel has no lockable signal (honest peak ~0.02):
+    // the estimator must refuse rather than analyze at an arbitrary lag.
+    // (Previously this passed via an f32 absorption phantom — a 10-sample
+    // noise lock by luck; see
+    // sotf-capture/docs/bug-math-dsp-lag-f32-absorption.md.)
+    let error = analyze_recording(&wav_path, &reference, sample_rate, None).unwrap_err();
     std::fs::remove_dir_all(&dir).ok();
 
-    // For a disconnected channel, the transfer function should be very low
-    // (noise / sweep ≈ noise floor). It must NOT show spurious high-dB peaks.
-    let max_db = result
-        .spl_db
-        .iter()
-        .zip(result.frequencies.iter())
-        .filter(|&(_, &f)| (100.0..=10000.0).contains(&f))
-        .map(|(&db, _)| db)
-        .fold(f32::NEG_INFINITY, f32::max);
-
     assert!(
-        max_db < 0.0,
-        "Silent/disconnected channel should not have positive dB values, got max {:.1} dB",
-        max_db
+        error.contains("Unable to estimate lag"),
+        "disconnected channel must fail honestly, got: {error}"
     );
 }
 

@@ -14,7 +14,11 @@ const MIN_LAG_CONFIDENCE: f32 = 0.05;
 
 /// Estimate lag between reference and recorded signals using cross-correlation
 ///
-/// Uses FFT-based cross-correlation for efficiency
+/// Uses FFT-based cross-correlation for efficiency. Only lags overlapping
+/// at least three quarters of the shorter signal are peak candidates: a
+/// true lock contains most of the stimulus, while small overlaps over
+/// quiet audio produce inflated or noisy correlations that would otherwise
+/// beat the true peak.
 ///
 /// # Arguments
 /// * `reference` - Reference signal
@@ -72,25 +76,49 @@ pub fn estimate_lag_with_confidence(
         *value *= inverse_scale;
     }
 
-    let reference_energy: f32 = reference.iter().map(|sample| sample * sample).sum();
-    let recorded_energy: f32 = recorded.iter().map(|sample| sample * sample).sum();
-    if reference_energy <= f32::EPSILON || recorded_energy <= f32::EPSILON {
+    let reference_energy: f64 = reference
+        .iter()
+        .map(|sample| f64::from(*sample) * f64::from(*sample))
+        .sum();
+    let recorded_energy: f64 = recorded
+        .iter()
+        .map(|sample| f64::from(*sample) * f64::from(*sample))
+        .sum();
+    if reference_energy <= f64::EPSILON || recorded_energy <= f64::EPSILON {
         return Err("Unable to estimate lag: one signal has no energy".to_string());
     }
 
     // Normalize each valid lag by the energy in its overlap. This makes the
     // peak a correlation coefficient rather than a record-length-dependent
     // amplitude, and lets us distinguish a real match from a noise maximum.
-    let mut reference_prefix = vec![0.0_f32; reference.len() + 1];
+    // Prefix sums stay in f64: with f32 accumulation, quiet regions (room
+    // tails tens of dB below the sweep) contribute sample squares far below
+    // the running total's ulp, so the additions are absorbed and the prefix
+    // stagnates. The overlap subtraction then reads near-zero energy,
+    // inflating the normalized correlation past 1.0 (clamped to exactly
+    // 1.000) and false-locking onto silence instead of the true peak.
+    let mut reference_prefix = vec![0.0_f64; reference.len() + 1];
     for (index, sample) in reference.iter().enumerate() {
-        reference_prefix[index + 1] = reference_prefix[index] + sample * sample;
+        reference_prefix[index + 1] =
+            reference_prefix[index] + f64::from(*sample) * f64::from(*sample);
     }
-    let mut recorded_prefix = vec![0.0_f32; recorded.len() + 1];
+    let mut recorded_prefix = vec![0.0_f64; recorded.len() + 1];
     for (index, sample) in recorded.iter().enumerate() {
-        recorded_prefix[index + 1] = recorded_prefix[index] + sample * sample;
+        recorded_prefix[index + 1] =
+            recorded_prefix[index] + f64::from(*sample) * f64::from(*sample);
     }
     let min_lag = -(reference.len() as isize - 1);
     let max_lag = recorded.len() as isize - 1;
+    // Peak candidacy requires most of the shorter signal to overlap. Small
+    // overlaps normalize over too little audio: their correlations are
+    // noisy (or, before the f64 prefix sums, catastrophically inflated),
+    // and the argmax would otherwise lock onto a tail fragment instead of
+    // the true alignment. Three quarters keeps legitimate partial locks
+    // (truncated takes, small shifts) while excluding tail phantoms, which
+    // need small overlaps over quiet audio to inflate.
+    let shorter = reference.len().min(recorded.len());
+    let min_overlap = (shorter * 3).div_ceil(4).max(1);
+    let mut saw_short_overlap = false;
     let mut candidates = Vec::with_capacity(reference.len() + recorded.len() - 1);
     for lag in min_lag..=max_lag {
         let (reference_start, recorded_start, length) = if lag >= 0 {
@@ -106,7 +134,11 @@ pub fn estimate_lag_with_confidence(
         let ref_energy =
             reference_prefix[reference_start + length] - reference_prefix[reference_start];
         let rec_energy = recorded_prefix[recorded_start + length] - recorded_prefix[recorded_start];
-        if ref_energy <= f32::EPSILON || rec_energy <= f32::EPSILON {
+        if ref_energy <= f64::EPSILON || rec_energy <= f64::EPSILON {
+            continue;
+        }
+        if length < min_overlap {
+            saw_short_overlap = true;
             continue;
         }
         let fft_index = if lag >= 0 {
@@ -115,7 +147,8 @@ pub fn estimate_lag_with_confidence(
             (fft_size as isize + lag) as usize
         };
         let correlation = cross_corr_fft[fft_index].re.abs();
-        let normalized = (correlation / (ref_energy * rec_energy).sqrt()).clamp(0.0, 1.0);
+        let normalized =
+            (f64::from(correlation) / (ref_energy * rec_energy).sqrt()).clamp(0.0, 1.0) as f32;
         candidates.push((lag, normalized, length, correlation));
     }
 
@@ -126,6 +159,11 @@ pub fn estimate_lag_with_confidence(
                 .then_with(|| correlation_a.total_cmp(correlation_b))
         },
     ) else {
+        if saw_short_overlap {
+            return Err(format!(
+                "Unable to estimate lag: no lock with sufficient overlap (minimum {min_overlap} samples)"
+            ));
+        }
         return Err("Unable to estimate lag: no overlapping signal energy".to_string());
     };
 

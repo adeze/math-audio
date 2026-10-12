@@ -11,6 +11,10 @@ use super::estimate::estimate_noise_floor_db_from_silence;
 use super::plan::deconvolve_sweep;
 use super::plan::plan_fft_forward;
 use super::plan::plan_fft_inverse;
+use crate::capture_tdoa::MAX_PLAUSIBLE_SKEW_PPM;
+use crate::capture_tdoa::MIN_TDOA_CONFIDENCE_DB;
+use crate::capture_tdoa::TdoaConfig;
+use crate::capture_tdoa::estimate_chirp_tdoa;
 use super::types::AveragedEssResponse;
 use super::types::AveragedResponse;
 use super::types::ClippingInfo;
@@ -777,35 +781,118 @@ pub fn fit_linear_phase_delay_seconds(
     Ok(-slope / (2.0 * std::f64::consts::PI))
 }
 
+/// Estimate relative sample-clock drift from a pair of identical timing chirps.
+///
+/// `chirp` is the timing template placed at both take ends;
+/// `expected_start_samples` / `expected_end_samples` are coarse take-clock
+/// positions of the two chirps (from the playback schedule plus the lag
+/// lock); `chirp_spacing_samples` is the EXACT stimulus-clock distance
+/// between the chirps. Each chirp is correlated only inside a window
+/// around its expected position: two identical chirps in one correlation
+/// are mutual sidelobes and collapse confidence. Sub-sample peak
+/// interpolation carries the ppm precision — integer lags quantize to
+/// ~21 ppm at 1 s / 48 kHz, above the usual 20 ppm action threshold.
+///
+/// `ppm` is computed from the fractional chirp positions; the reported
+/// integer lags are rounded from the same positions (the correction
+/// anchor needs an index; rounding there is harmless). Confidence maps
+/// the weaker chirp's peak-to-sidelobe ratio into `[0, 1]`. Any unusable
+/// input (missing/ambiguous/weak chirp, implausible spacing) is an
+/// honest `Err`, which callers treat as drift unknown.
+///
+/// This replaced two-window drift (sweep-start/end segments), which never
+/// worked on real takes: degenerate small-overlap locks when the audio is
+/// dense, and tens of samples of IR-centroid bias on the LF start window
+/// when honestly locked (see
+/// `sotf-capture/docs/bug-math-dsp-lag-f32-absorption.md`). Chirpless
+/// takes have no unbiased drift source; callers must not attempt drift
+/// there.
 pub fn estimate_clock_drift(
-    reference: &[f32],
+    chirp: &[f32],
     recording: &[f32],
+    expected_start_samples: usize,
+    expected_end_samples: usize,
+    chirp_spacing_samples: f64,
     sample_rate: u32,
 ) -> Result<ClockDriftEstimate, String> {
-    if sample_rate == 0 || reference.len() < 32 || recording.is_empty() {
+    if chirp.is_empty() || recording.is_empty() {
+        return Err("estimate_clock_drift: chirp and recording must be non-empty".to_string());
+    }
+    if sample_rate == 0 {
+        return Err("estimate_clock_drift: sample rate must be greater than zero".to_string());
+    }
+    if !chirp_spacing_samples.is_finite() || chirp_spacing_samples <= 0.0 {
         return Err(
-            "estimate_clock_drift: signals are too short or sample rate is zero".to_string(),
+            "estimate_clock_drift: chirp spacing must be positive and finite".to_string(),
         );
     }
-    let window = (reference.len() / 4).clamp(16, 8192);
-    if reference.len() < window * 2 {
+    if expected_end_samples <= expected_start_samples
+        || expected_start_samples >= recording.len()
+        || expected_end_samples >= recording.len()
+    {
         return Err(
-            "estimate_clock_drift: reference must contain two analysis windows".to_string(),
+            "estimate_clock_drift: expected chirp positions must be ordered and inside the recording"
+                .to_string(),
         );
     }
-    let start = estimate_lag_with_confidence(&reference[..window], recording)?;
-    let end_offset = reference.len() - window;
-    let end = estimate_lag_with_confidence(&reference[end_offset..], recording)?;
-    let elapsed_samples = end_offset as f64;
-    let lag_change = (end.lag_samples - start.lag_samples) as f64 - elapsed_samples;
+    if chirp
+        .iter()
+        .chain(recording)
+        .any(|sample| !sample.is_finite())
+    {
+        return Err("estimate_clock_drift: inputs must contain only finite samples".to_string());
+    }
+    // Window each chirp around its coarse position: the radius covers the
+    // worst plausible clock skew over the spacing plus one chirp length,
+    // mirroring the capture_session clock fit. A shared full-take
+    // correlation would let the identical chirps act as mutual sidelobes.
+    let radius =
+        (chirp_spacing_samples * MAX_PLAUSIBLE_SKEW_PPM / 1e6 + chirp.len() as f64).ceil() as usize;
+    let config = TdoaConfig {
+        sample_rate_hz: f64::from(sample_rate),
+        ..TdoaConfig::default()
+    };
+    let locate = |expected: usize, label: &str| -> Result<(f64, f64), String> {
+        let start = expected.saturating_sub(radius);
+        let stop = (expected + radius + chirp.len()).min(recording.len());
+        if stop.saturating_sub(start) < chirp.len() + 1 {
+            return Err(format!(
+                "estimate_clock_drift: {label} chirp window is too small for the template"
+            ));
+        }
+        let estimate = estimate_chirp_tdoa(chirp, &recording[start..stop], &config);
+        if !estimate.valid {
+            return Err(format!(
+                "estimate_clock_drift: {label} timing chirp is missing, ambiguous, or too weak"
+            ));
+        }
+        Ok((start as f64 + estimate.offset_samples, estimate.confidence_db))
+    };
+    let (start_pos, start_db) = locate(expected_start_samples, "start")?;
+    let (end_pos, end_db) = locate(expected_end_samples, "end")?;
+    let lag_change = (end_pos - start_pos) - chirp_spacing_samples;
     // Both quantities are measured in samples, so their ratio is the
     // relative sample-clock drift. Convert that dimensionless ratio to ppm.
-    let ppm = lag_change / elapsed_samples * 1e6;
+    let ppm = lag_change / chirp_spacing_samples * 1e6;
+    if !ppm.is_finite() || ppm.abs() > MAX_PLAUSIBLE_SKEW_PPM {
+        return Err(
+            "estimate_clock_drift: chirp spacing implies implausible skew (mis-associated chirps?)"
+                .to_string(),
+        );
+    }
+    // Confidence maps the weaker chirp's peak-to-sidelobe ratio into
+    // [0, 1]: the TDOA validity floor reads 0, 6 dB above it reads 1.
+    // Calibrated on measured chirp PSR — a clean matched chirp compresses
+    // to ≈11 dB (rectangular-chirp sidelobes), reading ≈0.9, while
+    // marginal ≈7 dB locks read ≈0.17 and fall below the usual 0.2
+    // drift-action gate.
+    let confidence =
+        ((start_db.min(end_db) - MIN_TDOA_CONFIDENCE_DB) / 6.0).clamp(0.0, 1.0) as f32;
     Ok(ClockDriftEstimate {
         ppm,
-        start_lag_samples: start.lag_samples,
-        end_lag_samples: end.lag_samples,
-        confidence: start.confidence.min(end.confidence),
+        start_lag_samples: start_pos.round() as isize,
+        end_lag_samples: end_pos.round() as isize,
+        confidence,
     })
 }
 
