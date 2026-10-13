@@ -34,6 +34,7 @@ mod plan;
 pub mod polynomial_convolution;
 pub mod right_preconditioner;
 mod smooth;
+mod sweep_lag;
 #[cfg(test)]
 mod tests;
 mod types;
@@ -62,6 +63,8 @@ pub use parallel_hammerstein::{
 pub(crate) use plan::deconvolve_sweep_f64_spectrum;
 pub use plan::*;
 pub use smooth::*;
+#[doc(inline)]
+pub use sweep_lag::{MIN_SWEEP_LAG_CONFIDENCE, estimate_sweep_lag_with_confidence};
 pub use types::*;
 pub use wav_analysis_config::*;
 pub use write::*;

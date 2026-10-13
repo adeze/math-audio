@@ -6,11 +6,11 @@
 
 use super::compute::compute_coherence_from_realizations;
 use super::compute::compute_thd_from_ir;
-use super::estimate::estimate_lag_with_confidence;
 use super::estimate::estimate_noise_floor_db_from_silence;
 use super::plan::deconvolve_sweep;
 use super::plan::plan_fft_forward;
 use super::plan::plan_fft_inverse;
+use super::sweep_lag::estimate_sweep_lag_with_confidence;
 use super::types::AveragedEssResponse;
 use super::types::AveragedResponse;
 use super::types::ClippingInfo;
@@ -61,6 +61,30 @@ pub fn analyze_ess_recording(
     sample_rate: u32,
     sweep_range: (f32, f32),
 ) -> Result<EssAnalysisResult, String> {
+    let lag = estimate_sweep_lag_with_confidence(reference, recording, sample_rate)?;
+    analyze_ess_recording_with_lag(recording, reference, sample_rate, sweep_range, lag)
+}
+
+/// Analyze an ESS capture using an already accepted timing estimate.
+///
+/// Uses the original samples and preserves the entire recorded tail. The caller
+/// must obtain `lag` from these same buffers; no second lock detector runs.
+///
+/// # Errors
+/// Returns an error for invalid samples, timing diagnostics, or incomplete overlap.
+pub fn analyze_ess_recording_with_lag(
+    recording: &[f32],
+    reference: &[f32],
+    sample_rate: u32,
+    sweep_range: (f32, f32),
+    lag: LagEstimate,
+) -> Result<EssAnalysisResult, String> {
+    if !lag.confidence.is_finite()
+        || !lag.normalized_peak.is_finite()
+        || lag.peak_to_sidelobe_db.is_nan()
+    {
+        return Err("analyze_ess_recording: invalid lag diagnostics".into());
+    }
     if sample_rate == 0 {
         return Err("analyze_ess_recording: sample rate must be greater than zero".to_string());
     }
@@ -82,7 +106,6 @@ pub fn analyze_ess_recording(
         return Err("analyze_ess_recording: inputs must contain only finite samples".to_string());
     }
 
-    let lag = estimate_lag_with_confidence(reference, recording)?;
     let lag_offset = lag.lag_samples.max(0) as usize;
     if lag.lag_samples < 0 {
         return Err(
@@ -388,6 +411,29 @@ pub fn average_ess_recordings(
     reference: &[f32],
     sample_rate: u32,
 ) -> Result<AveragedEssResponse, String> {
+    let lag_estimates = recordings
+        .iter()
+        .map(|recording| estimate_sweep_lag_with_confidence(reference, recording, sample_rate))
+        .collect::<Result<Vec<_>, _>>()?;
+    average_ess_recordings_with_lags(recordings, reference, sample_rate, &lag_estimates)
+}
+
+/// Align and average ESS captures using their accepted lag estimates.
+///
+/// Each estimate must describe its corresponding recording and this reference.
+/// Original samples and decay tails are preserved for deconvolution.
+///
+/// # Errors
+/// Returns an error for mismatched estimates, invalid samples, or incomplete overlap.
+pub fn average_ess_recordings_with_lags(
+    recordings: &[Vec<f32>],
+    reference: &[f32],
+    sample_rate: u32,
+    lags: &[LagEstimate],
+) -> Result<AveragedEssResponse, String> {
+    if lags.len() != recordings.len() {
+        return Err("average_ess_recordings: one lag is required per recording".into());
+    }
     if recordings.is_empty() {
         return Err("average_ess_recordings: no recordings".to_string());
     }
@@ -407,9 +453,16 @@ pub fn average_ess_recordings(
     let mut aligned_recordings = Vec::with_capacity(recordings.len());
     let mut common_length = reference.len();
     for (index, recording) in recordings.iter().enumerate() {
-        let lag = estimate_lag_with_confidence(reference, recording).map_err(|error| {
-            format!("average_ess_recordings: capture {index} lag estimation failed: {error}")
-        })?;
+        let lag = lags[index];
+        if recording.iter().any(|sample| !sample.is_finite())
+            || !lag.confidence.is_finite()
+            || !lag.normalized_peak.is_finite()
+            || lag.peak_to_sidelobe_db.is_nan()
+        {
+            return Err(format!(
+                "average_ess_recordings: capture {index} has invalid samples or timing"
+            ));
+        }
         if lag.lag_samples < 0 {
             return Err(format!(
                 "average_ess_recordings: capture {index} starts before the reference"
