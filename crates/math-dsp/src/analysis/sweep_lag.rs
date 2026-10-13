@@ -7,15 +7,19 @@ use super::plan::{plan_fft_forward, plan_fft_inverse};
 use super::types::LagEstimate;
 use rustfft::num_complex::Complex;
 
-/// Minimum excess-envelope confidence for an acoustic sweep lock.
+/// Minimum excess-envelope amplitude for an acoustic sweep lock.
 ///
 /// This is a detection score, not a probability. A normalized envelope must
-/// exceed its competing peaks by enough energy to clear this threshold.
+/// exceed its competing peaks by enough excess amplitude to clear this threshold.
 pub const MIN_SWEEP_LAG_CONFIDENCE: f32 = 0.2;
 
 // Partial whitening is intentionally bounded: a notch or an absent driver
 // must not give arbitrarily high weight to microphone noise.
 const MAX_WEIGHT_RATIO: f64 = 10.0;
+// Require 1.5 dB peak separation independently of absolute envelope strength.
+// This refuses nearly equal arrivals while allowing resolvable reflected takes
+// to reach repeat averaging, where response outliers are rejected separately.
+const MIN_PEAK_TO_SIDELOBE_DB: f32 = 1.5;
 // Each retained octave must carry at least 0.5% of reference energy and
 // 0.001% of capture energy. This excludes sweep leakage and absent bands.
 const MIN_REFERENCE_BAND_SHARE: f64 = 0.005;
@@ -30,7 +34,8 @@ const MIN_CAPTURE_BAND_SHARE: f64 = 0.00001;
 /// the earliest direct sound. Narrowband responses have lower timing resolution.
 ///
 /// Unlike the generic waveform estimator, confidence is the normalized envelope
-/// peak times the fraction of peak energy exceeding the largest distant peak.
+/// amplitude remaining after subtracting the largest distant peak in quadrature.
+/// The selected peak must also exceed competing peaks by at least 1.5 dB.
 /// Scores from the two methods must not be interpreted as probabilities.
 ///
 /// # Errors
@@ -228,10 +233,16 @@ pub fn estimate_sweep_lag_with_confidence(
     } else {
         1.0
     };
-    let confidence = normalized_peak * (1.0 - ratio * ratio);
-    if !confidence.is_finite() || confidence < MIN_SWEEP_LAG_CONFIDENCE {
+    // Both the envelope peak and the threshold are amplitude scores. Subtract
+    // competing energy in quadrature, then return to amplitude units. Applying
+    // the energy fraction directly to amplitude double-penalizes colored takes.
+    let confidence = normalized_peak * (1.0 - ratio * ratio).sqrt();
+    if !confidence.is_finite()
+        || confidence < MIN_SWEEP_LAG_CONFIDENCE
+        || peak_to_sidelobe_db < MIN_PEAK_TO_SIDELOBE_DB
+    {
         return Err(format!(
-            "Sweep lag: insufficient or ambiguous signal evidence (envelope peak {normalized_peak:.3}, confidence {confidence:.3} < {MIN_SWEEP_LAG_CONFIDENCE:.3}, PSR {peak_to_sidelobe_db:.1} dB, supported band {:.0}–{:.0} Hz, main-lobe guard {:.1} ms)",
+            "Sweep lag: insufficient or ambiguous signal evidence (envelope peak {normalized_peak:.3}, confidence {confidence:.3} (minimum {MIN_SWEEP_LAG_CONFIDENCE:.3}), PSR {peak_to_sidelobe_db:.1} dB (minimum {MIN_PEAK_TO_SIDELOBE_DB:.1} dB), supported band {:.0}–{:.0} Hz, main-lobe guard {:.1} ms)",
             bands[0].0,
             bands.last().unwrap().1,
             guard as f64 * 1000.0 / sample_rate as f64,
@@ -425,16 +436,24 @@ mod tests {
     }
 
     #[test]
-    fn sweep_lock_rejects_two_equally_strong_arrivals() {
+    fn sweep_lock_rejects_equal_and_nearly_equal_arrivals() {
         let rate = 8000;
         let reference = sweep(rate, 20.0, 3000.0);
         let delay = 1000;
         let echo = 800;
-        let mut take = delayed(&reference, delay + echo, rate);
-        for (index, &sample) in reference.iter().enumerate() {
-            take[delay + index] += sample;
+        for echo_gain in [1.0, 0.95, 0.9] {
+            let mut take = delayed(&reference, delay + echo, rate);
+            for sample in &mut take {
+                *sample *= echo_gain;
+            }
+            for (index, &sample) in reference.iter().enumerate() {
+                take[delay + index] += sample;
+            }
+            assert!(
+                estimate_sweep_lag_with_confidence(&reference, &take, rate).is_err(),
+                "echo gain {echo_gain}"
+            );
         }
-        assert!(estimate_sweep_lag_with_confidence(&reference, &take, rate).is_err());
     }
 
     #[test]
@@ -451,4 +470,40 @@ mod tests {
         let lag = estimate_sweep_lag_with_confidence(&reference, &take, rate).unwrap();
         assert_eq!(lag.lag_samples, delay as isize);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn colored_sweep_with_weaker_reflection_uses_excess_amplitude() {
+    let rate = 48000;
+    let reference = crate::signals::prepare_signal_for_playback(
+        crate::signals::gen_log_sweep(20.0, 20000.0, 0.5, rate, 5.0),
+        rate,
+        20.0,
+        250.0,
+    );
+    let delay = 12000;
+    let mut take = vec![0.0; delay + reference.len() + rate as usize];
+    // A 40 Hz room resonance plus a weaker arrival 7.2 ms later models a
+    // colored but resolvable acoustic sweep, without embedding hardware data.
+    let radius = (-1.0_f64 / (rate as f64 * 0.2)).exp();
+    let coefficient = 2.0 * radius * (2.0 * std::f64::consts::PI * 40.0 / rate as f64).cos();
+    let mut previous = [0.0_f64; 2];
+    for (index, sample) in reference.iter().enumerate() {
+        let resonance =
+            f64::from(*sample) + coefficient * previous[0] - radius * radius * previous[1];
+        previous = [resonance, previous[0]];
+        let filtered = *sample + (resonance * 0.00025) as f32;
+        take[delay + index] += filtered;
+        take[delay + index + 344] += filtered * 0.4;
+    }
+    let lag = estimate_sweep_lag_with_confidence(&reference, &take, rate).unwrap();
+    let competing_ratio = 10.0_f32.powf(-lag.peak_to_sidelobe_db / 20.0);
+    let old_confidence = lag.normalized_peak * (1.0 - competing_ratio.powi(2));
+    assert!(
+        old_confidence < MIN_SWEEP_LAG_CONFIDENCE,
+        "old gate must reproduce rejection: {lag:?}"
+    );
+    assert!(lag.confidence >= MIN_SWEEP_LAG_CONFIDENCE, "{lag:?}");
+    assert_eq!(lag.lag_samples, delay as isize);
 }
