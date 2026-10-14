@@ -55,6 +55,8 @@ impl Default for FirDesignContext {
     }
 }
 
+type MagnitudeProjection<'a, E> = dyn FnMut(&[f64], &mut [f64]) -> Result<(), E> + 'a;
+
 impl FirDesignContext {
     /// Create a new, empty context.
     #[must_use]
@@ -169,6 +171,63 @@ impl FirDesignContext {
         target_magnitude_db: &[f64],
         config: &FirDesignConfig,
     ) -> Vec<f64> {
+        match self.generate_kirkeby_correction_projected::<std::convert::Infallible>(
+            meas_freqs,
+            meas_magnitude_db,
+            meas_phase_deg,
+            target_magnitude_db,
+            config,
+            None,
+        ) {
+            Ok(coefficients) => coefficients,
+            Err(never) => match never {},
+        }
+    }
+
+    /// Project regularized Kirkeby magnitudes before realizing the FIR.
+    ///
+    /// The callback receives linear FFT frequencies and correction magnitudes
+    /// in dB after regularization and band transitions. Measured phase and its
+    /// excess-phase calculation remain unchanged. Windowing and the configured
+    /// pre-ringing policy run after projection. The callback owns numerical
+    /// validation of its projected magnitudes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the callback's error without realizing or returning coefficients.
+    ///
+    /// # Panics
+    ///
+    /// Panics if measurement/target arrays have different lengths, as does the
+    /// unprojected entry point. Callers must validate configuration beforehand.
+    pub fn generate_kirkeby_correction_with_magnitude_projection<E>(
+        &mut self,
+        meas_freqs: &[f64],
+        meas_magnitude_db: &[f64],
+        meas_phase_deg: Option<&[f64]>,
+        target_magnitude_db: &[f64],
+        config: &FirDesignConfig,
+        mut projection: impl FnMut(&[f64], &mut [f64]) -> Result<(), E>,
+    ) -> Result<Vec<f64>, E> {
+        self.generate_kirkeby_correction_projected(
+            meas_freqs,
+            meas_magnitude_db,
+            meas_phase_deg,
+            target_magnitude_db,
+            config,
+            Some(&mut projection),
+        )
+    }
+
+    fn generate_kirkeby_correction_projected<E>(
+        &mut self,
+        meas_freqs: &[f64],
+        meas_magnitude_db: &[f64],
+        meas_phase_deg: Option<&[f64]>,
+        target_magnitude_db: &[f64],
+        config: &FirDesignConfig,
+        projection: Option<&mut MagnitudeProjection<'_, E>>,
+    ) -> Result<Vec<f64>, E> {
         assert_eq!(
             meas_freqs.len(),
             meas_magnitude_db.len(),
@@ -272,6 +331,26 @@ impl FirDesignContext {
             self.complex_buf[i] = Complex64::from_polar(c_mag, c_phase);
         }
 
+        if let Some(project) = projection {
+            let original: Vec<f64> = self.complex_buf[..num_bins]
+                .iter()
+                .map(|value| 20.0 * value.norm().log10())
+                .collect();
+            let mut projected = original.clone();
+            project(&linear_freqs, &mut projected)?;
+            for ((value, before), after) in self.complex_buf[..num_bins]
+                .iter_mut()
+                .zip(original)
+                .zip(projected)
+            {
+                if before != after {
+                    // Positive real scaling preserves the computed phase. A
+                    // no-op projection leaves every spectrum bit untouched.
+                    *value *= 10.0_f64.powf((after - before) / 20.0);
+                }
+            }
+        }
+
         self.complex_buf[num_bins..fft_len].fill(Complex64::zero());
         self.complex_buf[fft_len / 2] = self.complex_buf[num_bins - 1];
         for i in 1..fft_len / 2 {
@@ -303,7 +382,7 @@ impl FirDesignContext {
             suppress_pre_ringing(&mut coeffs, pr_config, sample_rate);
         }
 
-        coeffs
+        Ok(coeffs)
     }
 
     /// Convert a magnitude spectrum to a minimum-phase complex spectrum.
