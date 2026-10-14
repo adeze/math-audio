@@ -23,6 +23,7 @@ pub mod audio_features;
 pub mod binaural_loudness;
 pub mod binaural_matrix;
 pub mod capture_array;
+pub mod capture_localization;
 pub mod capture_resample;
 pub mod capture_tdoa;
 pub mod ebur128;
