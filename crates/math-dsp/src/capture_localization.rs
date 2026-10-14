@@ -607,6 +607,15 @@ pub struct JointEstimate {
     pub mirror_ambiguous: bool,
     /// Joint iterations run before convergence.
     pub iterations: usize,
+    /// True when the surveyed coverage was too thin for consensus
+    /// cascade seeding, so LM#1 ran Huber from trilateration seeds: a
+    /// gross outlier can then absorb into null slides with clean
+    /// residuals and confident sigmas (28 cm at 70 sigma observed).
+    /// Positions are honest only if the links are clean — verify the
+    /// geometry when outliers are possible. False after a complete
+    /// cascade (wide-Tukey LM#1 keeps outliers flat from iteration
+    /// zero, so no stage ever fits one).
+    pub outlier_absorb_risk: bool,
 }
 
 /// Jointly self-calibrate unsurveyed sources and microphones.
@@ -616,14 +625,24 @@ pub struct JointEstimate {
 /// the measured cross range or `None` when refused upstream. Scale is
 /// fixed by the absolute ranges; the anchors fix the rigid frame.
 ///
-/// A trilateration warm start (exact on noiseless data up to the
-/// anchor-plane mirror) seeds joint Levenberg-Marquardt over all
-/// unknowns at once — per-point alternation cannot bootstrap here,
-/// because sweep-one sub-solves face mostly-unconverged anchors and
-/// diverge, while the joint gradient descends from the same start.
-/// Then a final polish sweep re-solves every unknown with exclusion
-/// against the converged frame, and the joint normal matrix over all
-/// unknowns is inverted once (Cholesky) for honest marginal sigmas.
+/// Seeding is a consensus cascade when coverage allows: unknowns with
+/// enough links to known positions seed by consensus trilateration
+/// (every triple votes, most inliers wins, Tukey cost breaks ties),
+/// round by round to a fixpoint, and wide-Tukey LM#1 converges from
+/// there with gross outliers flat from iteration zero — no stage ever
+/// fits one, so null slides cannot form. Thin coverage falls back to
+/// Huber LM#1 from trilateration/centroid seeds ([`JointEstimate`]
+/// flags `outlier_absorb_risk`: a wild link can absorb into null
+/// slides with clean residuals there). Per-point alternation cannot
+/// bootstrap either path — sweep-one sub-solves face
+/// mostly-unconverged anchors and diverge — so one joint
+/// Levenberg-Marquardt over all unknowns does the descending.
+/// Mirror-flip basin hopping (bad-count first, Tukey cost ties) then
+/// escapes anchor-plane traps; count-gated pre-hop plus post-hop
+/// 3.5-sigma exclusions with depletion re-gates drop outliers; a
+/// Jacobi polish replays the forward solver per unknown for exact
+/// single-point fits; and the joint normal matrix inverts once
+/// (Cholesky) for honest marginal sigmas.
 ///
 /// Returns `None` when the inputs disagree in shape, any surveyed seed
 /// is non-finite, fewer than [`MIN_JOINT_ANCHORS`] anchors exist, the
@@ -710,8 +729,8 @@ pub fn joint_self_calibrate(
             centroid[axis] += anchor[axis];
         }
     }
-    for axis in 0..3 {
-        centroid[axis] /= anchors.len() as f64;
+    for value in centroid.iter_mut() {
+        *value /= anchors.len() as f64;
     }
     // Anchor catalogue: position plus its (is_source, index) identity
     // for link lookup. Fixed order: sources then microphones.
@@ -760,8 +779,7 @@ pub fn joint_self_calibrate(
                 ranges_sm[cell].map(|(distance, _)| (*position, distance))
             })
             .collect();
-        source_positions[*source] =
-            warm_start(&links, &centroid, spread_index, &SPREAD);
+        source_positions[*source] = warm_start(&links, &centroid, spread_index, &SPREAD);
         spread_index += 1;
     }
     for mic in &unknown_mics {
@@ -782,169 +800,367 @@ pub fn joint_self_calibrate(
         mic_positions[*mic] = warm_start(&links, &centroid, spread_index, &SPREAD);
         spread_index += 1;
     }
-    // Joint Levenberg-Marquardt over all unknowns. Per-point
-    // alternation cannot bootstrap here: sweep-one sub-solves face
-    // mostly-unconverged anchors and diverge, while the joint gradient
-    // descends from the same warm start because every residual pulls at
-    // once. Adaptive damping retries each iteration up to a bounded
-    // number of lambda bumps; anything unbounded refuses.
-    let debug_joint = std::env::var("SOTF_DEBUG_JOINT").is_ok();
-    let mut lambda = 1.0e-3_f64;
-    let mut cost = joint_robust_cost(
-        &source_positions,
-        &mic_positions,
-        ranges_sm,
-        &usable,
-        sources,
-        mics,
-    )?;
-    let mut iterations = 0_usize;
-    let mut converged = false;
-    while !converged {
-        if iterations >= MAX_JOINT_ITERATIONS {
-            return None;
-        }
-        let (normal, gradient) = joint_normal_system(
-            &unknown_sources,
-            &unknown_mics,
+    // Joint Levenberg-Marquardt over all unknowns, restartable: the
+    // basin hopping below re-converges from mirror-flipped states
+    // through the same loop. Per-point alternation cannot bootstrap
+    // here: sweep-one sub-solves face mostly-unconverged anchors and
+    // diverge, while the joint gradient descends from the same warm
+    // start because every residual pulls at once. Adaptive damping
+    // retries each iteration up to a bounded number of lambda bumps;
+    // anything unbounded refuses.
+    let run_lm = |mut source_positions: Vec<[f64; 3]>,
+                  mut mic_positions: Vec<[f64; 3]>,
+                  link_mask: &[bool],
+                  loss: JointLoss|
+     -> Option<(JointFrames, f64, usize)> {
+        let mut lambda = 1.0e-3_f64;
+        let mut cost = joint_robust_cost(
             &source_positions,
             &mic_positions,
             ranges_sm,
-            &usable,
-            sources,
-            mics,
+            link_mask,
+            loss,
         )?;
-        let mut accepted = false;
-        for _ in 0..MAX_JOINT_LAMBDA_BUMPS {
-            let mut damped = normal.clone();
-            for axis in 0..damped.nrows() {
-                damped[(axis, axis)] += lambda;
+        let mut iterations = 0_usize;
+        let mut converged = false;
+        while !converged {
+            if iterations >= MAX_JOINT_ITERATIONS {
+                return None;
             }
-            let Some(decomposition) = damped.cholesky() else {
-                lambda *= 10.0;
-                continue;
-            };
-            // The bump loop may retry, so the gradient is cloned per
-            // attempt rather than moved.
-            let step = decomposition.solve(&(-gradient.clone()));
-            let mut trial_sources = source_positions.clone();
-            let mut trial_mics = mic_positions.clone();
-            for (slot, source) in unknown_sources.iter().enumerate() {
-                for axis in 0..3 {
-                    trial_sources[*source][axis] += step[slot * 3 + axis];
-                }
-            }
-            for (slot, mic) in unknown_mics.iter().enumerate() {
-                let base = (unknown_sources.len() + slot) * 3;
-                for axis in 0..3 {
-                    trial_mics[*mic][axis] += step[base + axis];
-                }
-            }
-            if !trial_sources.iter().chain(trial_mics.iter()).all(|point| {
-                point.iter().all(|c| c.is_finite())
-                    && model_distance_vec(point, &centroid) < 1.0e6
-            }) {
-                lambda *= 10.0;
-                continue;
-            }
-            let Some(trial_cost) = joint_robust_cost(
-                &trial_sources,
-                &trial_mics,
+            let (normal, gradient) = joint_normal_system(
+                &unknown_sources,
+                &unknown_mics,
+                &source_positions,
+                &mic_positions,
                 ranges_sm,
-                &usable,
-                sources,
-                mics,
-            ) else {
-                lambda *= 10.0;
-                continue;
-            };
-            if trial_cost < cost {
+                link_mask,
+                loss,
+            )?;
+            let mut accepted = false;
+            for _ in 0..MAX_JOINT_LAMBDA_BUMPS {
+                let mut damped = normal.clone();
+                for axis in 0..damped.nrows() {
+                    damped[(axis, axis)] += lambda;
+                }
+                let Some(decomposition) = damped.cholesky() else {
+                    lambda *= 10.0;
+                    continue;
+                };
+                // The bump loop may retry, so the gradient is cloned per
+                // attempt rather than moved.
+                let step = decomposition.solve(&(-gradient.clone()));
+                let mut trial_sources = source_positions.clone();
+                let mut trial_mics = mic_positions.clone();
+                for (slot, source) in unknown_sources.iter().enumerate() {
+                    for axis in 0..3 {
+                        trial_sources[*source][axis] += step[slot * 3 + axis];
+                    }
+                }
+                for (slot, mic) in unknown_mics.iter().enumerate() {
+                    let base = (unknown_sources.len() + slot) * 3;
+                    for axis in 0..3 {
+                        trial_mics[*mic][axis] += step[base + axis];
+                    }
+                }
+                if !trial_sources.iter().chain(trial_mics.iter()).all(|point| {
+                    point.iter().all(|c| c.is_finite())
+                        && model_distance_vec(point, &centroid) < 1.0e6
+                }) {
+                    lambda *= 10.0;
+                    continue;
+                }
+                let Some(trial_cost) =
+                    joint_robust_cost(&trial_sources, &trial_mics, ranges_sm, link_mask, loss)
+                else {
+                    lambda *= 10.0;
+                    continue;
+                };
                 let mut max_step = 0.0_f64;
                 for value in step.iter() {
                     max_step = max_step.max(value.abs());
                 }
-                source_positions = trial_sources;
-                mic_positions = trial_mics;
-                cost = trial_cost;
-                lambda = (lambda / 10.0).max(1.0e-12);
-                accepted = true;
-                if debug_joint {
-                    eprintln!("JOINT iter {iterations} cost {cost:.6} max_step {max_step:.3e}");
+                // Accept on strict improvement — or on a below-threshold
+                // step, which means the start was already optimal (a
+                // converged frame re-converges instead of refusing).
+                if trial_cost < cost || max_step < JOINT_CONVERGENCE_STEP_M {
+                    source_positions = trial_sources;
+                    mic_positions = trial_mics;
+                    cost = trial_cost;
+                    lambda = (lambda / 10.0).max(1.0e-12);
+                    accepted = true;
+                    converged = max_step < JOINT_CONVERGENCE_STEP_M;
+                    break;
                 }
-                converged = max_step < JOINT_CONVERGENCE_STEP_M;
-                break;
+                lambda *= 10.0;
+                if lambda > 1.0e12 {
+                    return None;
+                }
             }
-            lambda *= 10.0;
-            if lambda > 1.0e12 {
+            if !accepted {
                 return None;
             }
+            iterations += 1;
         }
-        if !accepted {
+        Some(((source_positions, mic_positions), cost, iterations))
+    };
+    // Seed-dependent LM#1 loss: a complete robust cascade puts every
+    // unknown millimetres off with wild links already excluded at seed
+    // time, so wide Tukey (gross outliers flat from iteration zero,
+    // inliers live) converges to the truth basin and the Huber slide
+    // never forms. Thin coverage falls back to Huber from the
+    // trilateration/centroid seeds.
+    let cascaded = joint_cascade_seeds(source_seeds, mic_seeds, ranges_sm, &usable);
+    let outlier_absorb_risk = cascaded.is_none();
+    let lm1_loss = match cascaded {
+        Some((cascade_sources, cascade_mics)) => {
+            source_positions = cascade_sources;
+            mic_positions = cascade_mics;
+            JointLoss::Tukey(TUKEY_WIDE_TUNING)
+        }
+        None => JointLoss::Huber,
+    };
+    let ((mut source_positions, mut mic_positions), _, mut iterations) =
+        run_lm(source_positions, mic_positions, &usable, lm1_loss)?;
+    // Pre-hop exclusion with a count gate: a Huber-converged frame is
+    // either right (bad links are outliers — drop them before hopping
+    // can bend onto them) or mirror-trapped (most links bad — dropping
+    // would massacre, so skip and let hopping escape first). Three or
+    // fewer bad links means right-with-outliers; more means trapped.
+    // `active` threads the survivors through hopping to the post-hop
+    // exclusion below.
+    const MAX_PREHOP_EXCLUSIONS: usize = 3;
+    let mut active = usable.clone();
+    let mut prehop_bad = Vec::new();
+    for (source, source_position) in source_positions.iter().enumerate() {
+        for (mic, mic_position) in mic_positions.iter().enumerate() {
+            let cell = source * mics + mic;
+            if !active[cell] {
+                continue;
+            }
+            let Some((distance, sigma)) = ranges_sm[cell] else {
+                continue;
+            };
+            let residual = (model_distance_vec(source_position, mic_position) - distance).abs();
+            if residual.is_finite() && residual > OUTLIER_SIGMA_MULTIPLE * sigma {
+                prehop_bad.push(cell);
+            }
+        }
+    }
+    if !prehop_bad.is_empty() && prehop_bad.len() <= MAX_PREHOP_EXCLUSIONS {
+        for cell in &prehop_bad {
+            active[*cell] = false;
+        }
+        if !joint_mask_satisfies_counts(
+            &active,
+            &unknown_sources,
+            &unknown_mics,
+            unknowns,
+            sources,
+            mics,
+        ) {
             return None;
         }
-        iterations += 1;
+        let ((unwarped_sources, unwarped_mics), _, unwarp_iters) = run_lm(
+            source_positions.clone(),
+            mic_positions.clone(),
+            &active,
+            JointLoss::Huber,
+        )?;
+        source_positions = unwarped_sources;
+        mic_positions = unwarped_mics;
+        iterations += unwarp_iters;
     }
-    // Final polish: every unknown re-solves with exclusion against the
-    // converged frame, so true outliers drop without cascade risk.
-    let mut source_polish: Vec<Option<PositionEstimate>> = vec![None; sources];
+    // Basin-hopping proposals are judged under the Tukey cost: a wild link
+    // already past tuning sits on the flat tail, so bending toward one cannot
+    // score as an improvement. Huber still pulls on outliers, so this frame
+    // may have flexed to fit one; hopping reconverges each flip trial under
+    // Tukey, where the wild links carry zero weight and the frame unbends.
+    let mut cost = joint_robust_cost(
+        &source_positions,
+        &mic_positions,
+        ranges_sm,
+        &active,
+        JointLoss::Tukey(TUKEY_TUNING),
+    )?;
+    let mut best_bad = joint_bad_count(&source_positions, &mic_positions, ranges_sm, &active);
+    // Basin hopping over mirror flips under Tukey cost: the
+    // anchor-plane mirror is the trap — individual unknowns converge
+    // mirrored while the frame is right, and no continuous step crosses
+    // the plane. Flip each unknown across the best-spread anchor
+    // triple's plane in fixed order, re-converge, keep strict
+    // improvements; three rounds bound the search. Tukey cost (not
+    // Huber) judges flips: past-tuning outliers sit on the flat tail,
+    // so bending toward one cannot score as an improvement.
+    // Deterministic (fixed order, first improvement).
+    const MAX_FLIP_ROUNDS: usize = 3;
+    let anchor_links: Vec<([f64; 3], f64)> = anchors.iter().map(|anchor| (*anchor, 0.0)).collect();
+    if let Some(triple) = best_anchor_triple(&anchor_links)
+        && let Some((origin, normal)) = anchor_plane(triple)
+    {
+        for _ in 0..MAX_FLIP_ROUNDS {
+            let mut improved = false;
+            for source in &unknown_sources {
+                let mut trial = source_positions.clone();
+                trial[*source] = reflect(&trial[*source], &origin, &normal);
+                if let Some(((cand_sources, cand_mics), cand_cost, cand_iters)) = run_lm(
+                    trial,
+                    mic_positions.clone(),
+                    &active,
+                    JointLoss::Tukey(TUKEY_TUNING),
+                ) {
+                    let cand_bad = joint_bad_count(&cand_sources, &cand_mics, ranges_sm, &active);
+                    // Ungameable accept: fewer bad links first (trap
+                    // escapes reduce the count; bending onto an outlier
+                    // raises it), Tukey cost only breaks ties — fitting
+                    // one more link always lowers a pure cost, so cost
+                    // alone would reward the bend.
+                    if cand_bad < best_bad || (cand_bad == best_bad && cand_cost < cost) {
+                        source_positions = cand_sources;
+                        mic_positions = cand_mics;
+                        cost = cand_cost;
+                        best_bad = cand_bad;
+                        iterations += cand_iters;
+                        improved = true;
+                    }
+                }
+            }
+            for mic in &unknown_mics {
+                let mut trial = mic_positions.clone();
+                trial[*mic] = reflect(&trial[*mic], &origin, &normal);
+                if let Some(((cand_sources, cand_mics), cand_cost, cand_iters)) = run_lm(
+                    source_positions.clone(),
+                    trial,
+                    &active,
+                    JointLoss::Tukey(TUKEY_TUNING),
+                ) {
+                    let cand_bad = joint_bad_count(&cand_sources, &cand_mics, ranges_sm, &active);
+                    // Ungameable accept: fewer bad links first (trap
+                    // escapes reduce the count; bending onto an outlier
+                    // raises it), Tukey cost only breaks ties — fitting
+                    // one more link always lowers a pure cost, so cost
+                    // alone would reward the bend.
+                    if cand_bad < best_bad || (cand_bad == best_bad && cand_cost < cost) {
+                        source_positions = cand_sources;
+                        mic_positions = cand_mics;
+                        cost = cand_cost;
+                        best_bad = cand_bad;
+                        iterations += cand_iters;
+                        improved = true;
+                    }
+                }
+            }
+            if !improved {
+                break;
+            }
+        }
+    }
+    let mut survivors = active.clone();
+    let mut excluded_any = false;
+    for (source, source_position) in source_positions.iter().enumerate() {
+        for (mic, mic_position) in mic_positions.iter().enumerate() {
+            let cell = source * mics + mic;
+            if !active[cell] {
+                continue;
+            }
+            let Some((distance, sigma)) = ranges_sm[cell] else {
+                continue;
+            };
+            let residual = (model_distance_vec(source_position, mic_position) - distance).abs();
+            if residual.is_finite() && residual > OUTLIER_SIGMA_MULTIPLE * sigma {
+                survivors[cell] = false;
+                excluded_any = true;
+            }
+        }
+    }
+    // Exclusions can deplete: re-gate the counting rules on survivors,
+    // then re-converge so the frame unbends from dropped outliers.
+    if !joint_mask_satisfies_counts(
+        &survivors,
+        &unknown_sources,
+        &unknown_mics,
+        unknowns,
+        sources,
+        mics,
+    ) {
+        return None;
+    }
+    let mut used_links = survivors;
+    if excluded_any {
+        let ((unbent_sources, unbent_mics), _, extra_iters) = run_lm(
+            source_positions.clone(),
+            mic_positions.clone(),
+            &used_links,
+            JointLoss::Huber,
+        )?;
+        source_positions = unbent_sources;
+        mic_positions = unbent_mics;
+        iterations += extra_iters;
+    }
+    // Final per-point polish on survivors: exact single-point fits
+    // against the unbent frame (Jacobi-style: all fits see the same
+    // frozen peers, so the result is order-free), with exclusion as a
+    // second net. In decoupled cases this replays `solve_position`
+    // bit-for-bit.
+    let mut source_fits: Vec<Option<PositionEstimate>> = vec![None; sources];
     for source in &unknown_sources {
         let row: Vec<Option<(f64, f64)>> = (0..mics)
             .map(|mic| {
                 let cell = source * mics + mic;
-                if usable[cell] {
+                if used_links[cell] {
                     ranges_sm[cell]
                 } else {
                     None
                 }
             })
             .collect();
-        source_polish[*source] = Some(solve_position(&mic_positions, &row)?);
+        source_fits[*source] = Some(solve_position(&mic_positions, &row)?);
     }
-    let mut mic_polish: Vec<Option<PositionEstimate>> = vec![None; mics];
+    let mut mic_fits: Vec<Option<PositionEstimate>> = vec![None; mics];
     for mic in &unknown_mics {
         let column: Vec<Option<(f64, f64)>> = (0..sources)
             .map(|source| {
                 let cell = source * mics + mic;
-                if usable[cell] {
+                if used_links[cell] {
                     ranges_sm[cell]
                 } else {
                     None
                 }
             })
             .collect();
-        mic_polish[*mic] = Some(solve_position(&source_positions, &column)?);
+        mic_fits[*mic] = Some(solve_position(&source_positions, &column)?);
     }
     for source in &unknown_sources {
-        let Some(polish) = &source_polish[*source] else {
+        let Some(fit) = &source_fits[*source] else {
             return None;
         };
-        source_positions[*source] = polish.position_m;
+        source_positions[*source] = fit.position_m;
+        for (mic, kept) in fit.used.iter().enumerate() {
+            if !kept {
+                used_links[source * mics + mic] = false;
+            }
+        }
     }
     for mic in &unknown_mics {
-        let Some(polish) = &mic_polish[*mic] else {
+        let Some(fit) = &mic_fits[*mic] else {
             return None;
         };
-        mic_positions[*mic] = polish.position_m;
-    }
-    // A link survives only when usable and accepted by both endpoints'
-    // polish (surveyed endpoints accept everything usable).
-    let mut used_links = vec![false; sources * mics];
-    for source in 0..sources {
-        for mic in 0..mics {
-            let cell = source * mics + mic;
-            if !usable[cell] {
-                continue;
+        mic_positions[*mic] = fit.position_m;
+        for (source, kept) in fit.used.iter().enumerate() {
+            if !kept {
+                used_links[source * mics + mic] = false;
             }
-            let source_used = match &source_polish[source] {
-                Some(polish) => polish.used.get(mic).copied().unwrap_or(false),
-                None => true,
-            };
-            let mic_used = match &mic_polish[mic] {
-                Some(polish) => polish.used.get(source).copied().unwrap_or(false),
-                None => true,
-            };
-            used_links[cell] = source_used && mic_used;
         }
+    }
+    // The second net can deplete: re-gate before publishing.
+    if !joint_mask_satisfies_counts(
+        &used_links,
+        &unknown_sources,
+        &unknown_mics,
+        unknowns,
+        sources,
+        mics,
+    ) {
+        return None;
     }
     let sigmas = joint_marginal_sigmas(
         &unknown_sources,
@@ -953,13 +1169,11 @@ pub fn joint_self_calibrate(
         &mic_positions,
         ranges_sm,
         &used_links,
-        sources,
-        mics,
     )?;
     let mut rms_sum = 0.0_f64;
     let mut rms_count = 0_usize;
-    for source in 0..sources {
-        for mic in 0..mics {
+    for (source, source_position) in source_positions.iter().enumerate() {
+        for (mic, mic_position) in mic_positions.iter().enumerate() {
             let cell = source * mics + mic;
             if !used_links[cell] {
                 continue;
@@ -967,7 +1181,7 @@ pub fn joint_self_calibrate(
             let Some((distance, _)) = ranges_sm[cell] else {
                 continue;
             };
-            let residual = model_distance_vec(&source_positions[source], &mic_positions[mic]) - distance;
+            let residual = model_distance_vec(source_position, mic_position) - distance;
             if !residual.is_finite() {
                 return None;
             }
@@ -987,8 +1201,6 @@ pub fn joint_self_calibrate(
             &mic_positions,
             ranges_sm,
             &used_links,
-            sources,
-            mics,
             &sigmas[slot * 3..slot * 3 + 3],
         )?);
     }
@@ -1002,8 +1214,6 @@ pub fn joint_self_calibrate(
             &mic_positions,
             ranges_sm,
             &used_links,
-            sources,
-            mics,
             &sigmas[base..base + 3],
         )?);
     }
@@ -1014,6 +1224,7 @@ pub fn joint_self_calibrate(
         used_links,
         mirror_ambiguous: geometry_rank(&anchors).rank < 3,
         iterations,
+        outlier_absorb_risk,
     })
 }
 
@@ -1036,12 +1247,12 @@ fn warm_start(
     spread_index: usize,
     spread_axes: &[[f64; 3]; 6],
 ) -> [f64; 3] {
-    if let Some(triple) = best_anchor_triple(links) {
-        if let Some(point) = trilaterate(triple) {
-            return point;
-        }
+    if let Some(triple) = best_anchor_triple(links)
+        && let Some(point) = trilaterate(triple)
+    {
+        return point;
     }
-    let radius = 2.0 * f64::from(1 + (spread_index / spread_axes.len()) as u32);
+    let radius = 0.5 * f64::from(1 + (spread_index / spread_axes.len()) as u32);
     let axis = spread_axes[spread_index % spread_axes.len()];
     [
         centroid[0] + radius * axis[0],
@@ -1052,11 +1263,11 @@ fn warm_start(
 
 /// Best-spread anchor triple: the combination maximizing the minimum
 /// pairwise anchor distance. Deterministic (first maximum wins).
-fn best_anchor_triple(links: &[([f64; 3], f64)]) -> Option<[([f64; 3], f64); 3]> {
+fn best_anchor_triple(links: &[([f64; 3], f64)]) -> Option<AnchorTriple> {
     if links.len() < 3 {
         return None;
     }
-    let mut best: Option<([([f64; 3], f64); 3], f64)> = None;
+    let mut best: Option<(AnchorTriple, f64)> = None;
     for i in 0..links.len() {
         for j in (i + 1)..links.len() {
             for k in (j + 1)..links.len() {
@@ -1077,6 +1288,34 @@ fn best_anchor_triple(links: &[([f64; 3], f64)]) -> Option<[([f64; 3], f64); 3]>
     best.map(|(triple, _)| triple)
 }
 
+/// Anchor-triple plane as (origin, unit normal); `None` when the
+/// triple degenerates. The basin hopping reflects unknowns across
+/// this plane to escape mirror traps.
+fn anchor_plane(triple: AnchorTriple) -> Option<([f64; 3], [f64; 3])> {
+    let [(a, _), (b, _), (c, _)] = triple;
+    let ab = Vector3::new(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+    let ac = Vector3::new(c[0] - a[0], c[1] - a[1], c[2] - a[2]);
+    let normal = ab.cross(&ac);
+    let norm = normal.norm();
+    if !norm.is_finite() || norm <= 1.0e-9 {
+        return None;
+    }
+    let unit = normal / norm;
+    Some((a, [unit[0], unit[1], unit[2]]))
+}
+
+/// Reflect a point across the plane through `origin` with unit `normal`.
+fn reflect(point: &[f64; 3], origin: &[f64; 3], normal: &[f64; 3]) -> [f64; 3] {
+    let along = (point[0] - origin[0]) * normal[0]
+        + (point[1] - origin[1]) * normal[1]
+        + (point[2] - origin[2]) * normal[2];
+    [
+        point[0] - 2.0 * along * normal[0],
+        point[1] - 2.0 * along * normal[1],
+        point[2] - 2.0 * along * normal[2],
+    ]
+}
+
 /// Closed-form trilateration from three anchor ranges.
 ///
 /// Returns the +normal-side solution; `None` when the triple
@@ -1084,7 +1323,7 @@ fn best_anchor_triple(links: &[([f64; 3], f64)]) -> Option<[([f64; 3], f64); 3]>
 /// squared height (noisy ranges missing intersection) clamps to the
 /// anchor plane — a start, not a solution; the joint iterations refine
 /// from there.
-fn trilaterate(triple: [([f64; 3], f64); 3]) -> Option<[f64; 3]> {
+fn trilaterate(triple: AnchorTriple) -> Option<[f64; 3]> {
     let [(a, ra), (b, rb), (c, rc)] = triple;
     let va = Vector3::new(a[0], a[1], a[2]);
     let ab = Vector3::new(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
@@ -1111,8 +1350,8 @@ fn trilaterate(triple: [([f64; 3], f64); 3]) -> Option<[f64; 3]> {
         }
     }
     let x = (ra * ra - rb * rb + distance * distance) / (2.0 * distance);
-    let y = (ra * ra - rc * rc + along * along + cross * cross) / (2.0 * cross)
-        - (along / cross) * x;
+    let y =
+        (ra * ra - rc * rc + along * along + cross * cross) / (2.0 * cross) - (along / cross) * x;
     let height_sq = ra * ra - x * x - y * y;
     if !height_sq.is_finite() {
         return None;
@@ -1125,12 +1364,100 @@ fn trilaterate(triple: [([f64; 3], f64); 3]) -> Option<[f64; 3]> {
     }
 }
 
+/// Robust loss for one joint fit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum JointLoss {
+    /// Huber (monotone): converges from poor starts but still pulls on
+    /// outliers, so the frame can slide to fit them.
+    Huber,
+    /// Tukey bisquare (redescending) with the tuning in sigmas:
+    /// links past `tuning` get zero weight. Needs a close start —
+    /// past-tuning inliers exert no pull, so a cold start stalls.
+    Tukey(f64),
+}
+
+/// Tukey bisquare tuning in sigmas (95% efficiency at the Gaussian):
+/// judges basin-hopping proposals, where the frame is converged.
+const TUKEY_TUNING: f64 = 4.685;
+
+/// Wide Tukey tuning for LM#1 after cascade seeding: cascade seeds sit
+/// millimetres off, deep inside 20 sigmas with live gradients, while a
+/// gross outlier stays on the flat tail from iteration zero — the slide
+/// Huber would dig never forms.
+const TUKEY_WIDE_TUNING: f64 = 20.0;
+
+/// Joint position frames: all sources, then all microphones.
+type JointFrames = (Vec<[f64; 3]>, Vec<[f64; 3]>);
+
+/// Anchor triple with ranges for trilateration and mirror geometry.
+type AnchorTriple = [([f64; 3], f64); 3];
+
+/// Robust weight for a residual under one loss (`None` when the
+/// residual or sigma is unusable).
+fn joint_weight(loss: JointLoss, residual: f64, sigma: f64) -> Option<f64> {
+    if !residual.is_finite() || !sigma.is_finite() || sigma <= 0.0 {
+        return None;
+    }
+    let scaled = (residual / sigma).abs();
+    if !scaled.is_finite() {
+        return None;
+    }
+    match loss {
+        JointLoss::Huber => {
+            let huber = (HUBER_SIGMA_MULTIPLE / scaled).min(1.0);
+            if huber.is_finite() {
+                Some(huber / (sigma * sigma))
+            } else {
+                None
+            }
+        }
+        JointLoss::Tukey(tuning) => {
+            if scaled >= tuning {
+                Some(0.0)
+            } else {
+                let down = 1.0 - (scaled / tuning).powi(2);
+                Some(down * down / (sigma * sigma))
+            }
+        }
+    }
+}
+
+/// Robust cost density for a residual under one loss, sigma-normalised
+/// like [`robust_cost`] (`None` when unusable).
+fn joint_rho(loss: JointLoss, residual: f64, sigma: f64) -> Option<f64> {
+    if !residual.is_finite() || !sigma.is_finite() || sigma <= 0.0 {
+        return None;
+    }
+    let magnitude = residual.abs();
+    match loss {
+        JointLoss::Huber => {
+            let delta = HUBER_SIGMA_MULTIPLE * sigma;
+            let rho = if magnitude <= delta {
+                0.5 * magnitude * magnitude
+            } else {
+                delta * (magnitude - 0.5 * delta)
+            };
+            Some(rho / (sigma * sigma))
+        }
+        JointLoss::Tukey(tuning) => {
+            let cutoff = tuning * sigma;
+            let flat = cutoff * cutoff / 6.0;
+            if magnitude >= cutoff {
+                Some(flat / (sigma * sigma))
+            } else {
+                let down = 1.0 - (magnitude / cutoff).powi(2);
+                Some(flat * (1.0 - down * down * down) / (sigma * sigma))
+            }
+        }
+    }
+}
+
 /// Weighted joint normal system `(J'WJ, J'Wr)` over all unknowns.
 ///
 /// `link_mask` selects the cells (the usable mask while iterating, the
-/// polish-survivor mask for the final covariance). Jacobian rows carry
-/// +unit at the source block and -unit at the mic block; surveyed
-/// endpoints contribute no columns. `None` on collapse.
+/// survivor mask for the final covariance). Jacobian rows carry +unit
+/// at the source block and -unit at the mic block; surveyed endpoints
+/// contribute no columns. `None` on collapse.
 fn joint_normal_system(
     unknown_sources: &[usize],
     unknown_mics: &[usize],
@@ -1138,10 +1465,11 @@ fn joint_normal_system(
     mic_positions: &[[f64; 3]],
     ranges_sm: &[Option<(f64, f64)>],
     link_mask: &[bool],
-    sources: usize,
-    mics: usize,
+    loss: JointLoss,
 ) -> Option<(DMatrix<f64>, DVector<f64>)> {
     let unknowns = unknown_sources.len() + unknown_mics.len();
+    let sources = source_positions.len();
+    let mics = mic_positions.len();
     let mut unknown_id = vec![usize::MAX; sources + mics];
     for (slot, source) in unknown_sources.iter().enumerate() {
         unknown_id[*source] = slot;
@@ -1152,8 +1480,8 @@ fn joint_normal_system(
     let dim = 3 * unknowns;
     let mut normal = DMatrix::<f64>::zeros(dim, dim);
     let mut gradient = DVector::<f64>::zeros(dim);
-    for source in 0..sources {
-        for mic in 0..mics {
+    for (source, source_position) in source_positions.iter().enumerate() {
+        for (mic, mic_position) in mic_positions.iter().enumerate() {
             let cell = source * mics + mic;
             if !link_mask.get(cell).copied().unwrap_or(false) {
                 continue;
@@ -1161,26 +1489,17 @@ fn joint_normal_system(
             let Some((distance, sigma)) = ranges_sm.get(cell).copied().flatten() else {
                 continue;
             };
-            let from = &source_positions[source];
-            let to = &mic_positions[mic];
-            let model = model_distance_vec(from, to);
+            let model = model_distance_vec(source_position, mic_position);
             if !model.is_finite() || model <= MIN_MODEL_DISTANCE_M {
                 return None;
             }
             let unit = [
-                (from[0] - to[0]) / model,
-                (from[1] - to[1]) / model,
-                (from[2] - to[2]) / model,
+                (source_position[0] - mic_position[0]) / model,
+                (source_position[1] - mic_position[1]) / model,
+                (source_position[2] - mic_position[2]) / model,
             ];
             let residual = model - distance;
-            if !residual.is_finite() {
-                return None;
-            }
-            let huber = (HUBER_SIGMA_MULTIPLE * sigma / residual.abs()).min(1.0);
-            if !huber.is_finite() {
-                return None;
-            }
-            let weight = huber / (sigma * sigma);
+            let weight = joint_weight(loss, residual, sigma)?;
             let mut blocks: [(usize, f64); 2] = [(usize::MAX, 0.0); 2];
             let mut count = 0_usize;
             let source_unknown = unknown_id[source];
@@ -1201,11 +1520,8 @@ fn joint_normal_system(
                 for b in 0..count {
                     for axis_a in 0..3 {
                         for axis_b in 0..3 {
-                            normal[(3 * blocks[a].0 + axis_a, 3 * blocks[b].0 + axis_b)] += weight
-                                * blocks[a].1
-                                * blocks[b].1
-                                * unit[axis_a]
-                                * unit[axis_b];
+                            normal[(3 * blocks[a].0 + axis_a, 3 * blocks[b].0 + axis_b)] +=
+                                weight * blocks[a].1 * blocks[b].1 * unit[axis_a] * unit[axis_b];
                         }
                     }
                 }
@@ -1215,19 +1531,248 @@ fn joint_normal_system(
     Some((normal, gradient))
 }
 
-/// Huber robust cost over masked links, sigma-normalised (mirrors
-/// [`robust_cost`]). `None` on collapse or a non-finite residual.
+/// Robust cost over masked links under one loss, sigma-normalised
+/// like [`robust_cost`]. `None` on a non-finite residual.
+/// Consensus cascade pre-solve: unknowns with at least
+/// [`MIN_RANGES_FOR_FIX`] links to already-known positions seed by
+/// consensus trilateration, round by round to a fixpoint (surveyed
+/// links first, then links to solved peers). Consensus outvotes a wild
+/// link instead of fitting it, so LM#1 on cascade seeds starts at the
+/// truth basin. `None` unless EVERY unknown seeds (thin coverage falls
+/// back to Huber LM#1 from the trilateration seeds, never fails closed
+/// here).
+/// Consensus trilateration seed: every known-link triple proposes its
+/// mirror pair; the candidate with the most inliers (residual within
+/// the exclusion threshold over ALL known links) wins, Tukey cost
+/// breaks ties. Inlier count alone ties truth with the slide — both
+/// hold all-but-one links — and a Huber tiebreak prefers the slide
+/// (fitting the lie is cheaper than capping it); Tukey puts the wild
+/// link on the flat tail either way, so the tighter inlier fit wins.
+/// `None` unless the winner holds at least [`MIN_RANGES_FOR_FIX`]
+/// inliers. Deterministic (fixed triple order, strict improvement).
+fn joint_consensus_seed(known: &[([f64; 3], f64, f64)]) -> Option<[f64; 3]> {
+    if known.len() < MIN_RANGES_FOR_FIX {
+        return None;
+    }
+    let mut best: Option<([f64; 3], usize, f64)> = None;
+    for i in 0..known.len() {
+        for j in (i + 1)..known.len() {
+            for k in (j + 1)..known.len() {
+                let triple = [
+                    (known[i].0, known[i].1),
+                    (known[j].0, known[j].1),
+                    (known[k].0, known[k].1),
+                ];
+                let Some(point) = trilaterate(triple) else {
+                    continue;
+                };
+                let mut candidates = vec![point];
+                if let Some((origin, normal)) = anchor_plane(triple) {
+                    candidates.push(reflect(&point, &origin, &normal));
+                }
+                for candidate in candidates {
+                    let mut inliers = 0_usize;
+                    let mut cost = 0.0_f64;
+                    let mut usable_candidate = true;
+                    for (anchor, distance, sigma) in known {
+                        let residual = (model_distance_vec(&candidate, anchor) - distance).abs();
+                        if !residual.is_finite() {
+                            usable_candidate = false;
+                            break;
+                        }
+                        if residual <= OUTLIER_SIGMA_MULTIPLE * sigma {
+                            inliers += 1;
+                        }
+                        let Some(density) =
+                            joint_rho(JointLoss::Tukey(TUKEY_TUNING), residual, *sigma)
+                        else {
+                            usable_candidate = false;
+                            break;
+                        };
+                        cost += density;
+                    }
+                    if !usable_candidate {
+                        continue;
+                    }
+                    let better = match &best {
+                        None => true,
+                        Some((_, held_inliers, held_cost)) => {
+                            inliers > *held_inliers
+                                || (inliers == *held_inliers && cost < *held_cost)
+                        }
+                    };
+                    if better {
+                        best = Some((candidate, inliers, cost));
+                    }
+                }
+            }
+        }
+    }
+    let (point, inliers, _) = best?;
+    if inliers >= MIN_RANGES_FOR_FIX {
+        Some(point)
+    } else {
+        None
+    }
+}
+
+fn joint_cascade_seeds(
+    source_seeds: &[Option<[f64; 3]>],
+    mic_seeds: &[Option<[f64; 3]>],
+    ranges_sm: &[Option<(f64, f64)>],
+    usable: &[bool],
+) -> Option<JointFrames> {
+    let sources = source_seeds.len();
+    let mics = mic_seeds.len();
+    let mut known_sources: Vec<Option<[f64; 3]>> = source_seeds.to_vec();
+    let mut known_mics: Vec<Option<[f64; 3]>> = mic_seeds.to_vec();
+    let unknown_sources: Vec<usize> = source_seeds
+        .iter()
+        .enumerate()
+        .filter(|(_, seed)| seed.is_none())
+        .map(|(index, _)| index)
+        .collect();
+    let unknown_mics: Vec<usize> = mic_seeds
+        .iter()
+        .enumerate()
+        .filter(|(_, seed)| seed.is_none())
+        .map(|(index, _)| index)
+        .collect();
+    for _ in 0..unknown_sources.len() + unknown_mics.len() {
+        let mut progress = false;
+        for source in &unknown_sources {
+            if known_sources[*source].is_some() {
+                continue;
+            }
+            let mut links = Vec::new();
+            for (mic, known) in known_mics.iter().enumerate() {
+                let cell = source * mics + mic;
+                if !usable.get(cell).copied().unwrap_or(false) {
+                    continue;
+                }
+                let (Some(position), Some((distance, sigma))) =
+                    (known, ranges_sm.get(cell).copied().flatten())
+                else {
+                    continue;
+                };
+                links.push((*position, distance, sigma));
+            }
+            // A refusal retries next round (more knowns may repair it);
+            // only thin final coverage fails the cascade.
+            if let Some(seed) = joint_consensus_seed(&links) {
+                known_sources[*source] = Some(seed);
+                progress = true;
+            }
+        }
+        for mic in &unknown_mics {
+            if known_mics[*mic].is_some() {
+                continue;
+            }
+            let mut links = Vec::new();
+            for (source, known) in known_sources.iter().enumerate() {
+                let cell = source * mics + mic;
+                if !usable.get(cell).copied().unwrap_or(false) {
+                    continue;
+                }
+                let (Some(position), Some((distance, sigma))) =
+                    (known, ranges_sm.get(cell).copied().flatten())
+                else {
+                    continue;
+                };
+                links.push((*position, distance, sigma));
+            }
+            if let Some(seed) = joint_consensus_seed(&links) {
+                known_mics[*mic] = Some(seed);
+                progress = true;
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+    let mut source_positions = Vec::with_capacity(sources);
+    for known in &known_sources {
+        source_positions.push((*known)?);
+    }
+    let mut mic_positions = Vec::with_capacity(mics);
+    for known in &known_mics {
+        mic_positions.push((*known)?);
+    }
+    Some((source_positions, mic_positions))
+}
+
+/// Count of masked-in links whose residual exceeds the forward solver's
+/// exclusion threshold. Hopping judges this count before cost: a trap
+/// escape reduces it while bending onto an outlier raises it, so the
+/// accept/reject cannot game a pure cost by fitting one more link.
+fn joint_bad_count(
+    source_positions: &[[f64; 3]],
+    mic_positions: &[[f64; 3]],
+    ranges_sm: &[Option<(f64, f64)>],
+    mask: &[bool],
+) -> usize {
+    let mut bad = 0_usize;
+    let mics = mic_positions.len();
+    for (source, source_position) in source_positions.iter().enumerate() {
+        for (mic, mic_position) in mic_positions.iter().enumerate() {
+            let cell = source * mics + mic;
+            if !mask.get(cell).copied().unwrap_or(false) {
+                continue;
+            }
+            let Some((distance, sigma)) = ranges_sm.get(cell).copied().flatten() else {
+                continue;
+            };
+            let residual = (model_distance_vec(source_position, mic_position) - distance).abs();
+            if residual.is_finite() && residual > OUTLIER_SIGMA_MULTIPLE * sigma {
+                bad += 1;
+            }
+        }
+    }
+    bad
+}
+
+/// Counting gates on a survivor mask: the global 3-links-per-unknown
+/// floor plus the 4-link floor per unknown. Shared by the pre-hop,
+/// post-hop, and final depletion checks so all three refuse identically.
+fn joint_mask_satisfies_counts(
+    mask: &[bool],
+    unknown_sources: &[usize],
+    unknown_mics: &[usize],
+    unknowns: usize,
+    sources: usize,
+    mics: usize,
+) -> bool {
+    if mask.iter().filter(|kept| **kept).count() < 3 * unknowns {
+        return false;
+    }
+    for source in unknown_sources {
+        let links = (0..mics).filter(|mic| mask[source * mics + mic]).count();
+        if links < MIN_RANGES_FOR_FIX {
+            return false;
+        }
+    }
+    for mic in unknown_mics {
+        let links = (0..sources)
+            .filter(|source| mask[source * mics + mic])
+            .count();
+        if links < MIN_RANGES_FOR_FIX {
+            return false;
+        }
+    }
+    true
+}
+
 fn joint_robust_cost(
     source_positions: &[[f64; 3]],
     mic_positions: &[[f64; 3]],
     ranges_sm: &[Option<(f64, f64)>],
     link_mask: &[bool],
-    sources: usize,
-    mics: usize,
+    loss: JointLoss,
 ) -> Option<f64> {
     let mut cost = 0.0_f64;
-    for source in 0..sources {
-        for mic in 0..mics {
+    let mics = mic_positions.len();
+    for (source, source_position) in source_positions.iter().enumerate() {
+        for (mic, mic_position) in mic_positions.iter().enumerate() {
             let cell = source * mics + mic;
             if !link_mask.get(cell).copied().unwrap_or(false) {
                 continue;
@@ -1235,18 +1780,8 @@ fn joint_robust_cost(
             let Some((distance, sigma)) = ranges_sm.get(cell).copied().flatten() else {
                 continue;
             };
-            let model = model_distance_vec(&source_positions[source], &mic_positions[mic]);
-            let residual = (model - distance).abs();
-            if !residual.is_finite() {
-                return None;
-            }
-            let delta = HUBER_SIGMA_MULTIPLE * sigma;
-            let rho = if residual <= delta {
-                0.5 * residual * residual
-            } else {
-                delta * (residual - 0.5 * delta)
-            };
-            cost += rho / (sigma * sigma);
+            let model = model_distance_vec(source_position, mic_position);
+            cost += joint_rho(loss, model - distance, sigma)?;
         }
     }
     Some(cost)
@@ -1265,8 +1800,6 @@ fn joint_marginal_sigmas(
     mic_positions: &[[f64; 3]],
     ranges_sm: &[Option<(f64, f64)>],
     used_links: &[bool],
-    sources: usize,
-    mics: usize,
 ) -> Option<Vec<f64>> {
     let (mut normal, _) = joint_normal_system(
         unknown_sources,
@@ -1275,8 +1808,7 @@ fn joint_marginal_sigmas(
         mic_positions,
         ranges_sm,
         used_links,
-        sources,
-        mics,
+        JointLoss::Huber,
     )?;
     for axis in 0..normal.nrows() {
         normal[(axis, axis)] += LEVENBERG_DAMPING;
@@ -1301,10 +1833,9 @@ fn point_summary(
     mic_positions: &[[f64; 3]],
     ranges_sm: &[Option<(f64, f64)>],
     used_links: &[bool],
-    sources: usize,
-    mics: usize,
     sigma3: &[f64],
 ) -> Option<JointPoint> {
+    let mics = mic_positions.len();
     let position_m = if is_source {
         source_positions.get(index).copied()?
     } else {
@@ -1314,7 +1845,7 @@ fn point_summary(
     let mut count = 0_usize;
     let mut sigmas = Vec::new();
     if is_source {
-        for mic in 0..mics {
+        for (mic, mic_position) in mic_positions.iter().enumerate() {
             let cell = index * mics + mic;
             if !used_links.get(cell).copied().unwrap_or(false) {
                 continue;
@@ -1322,7 +1853,7 @@ fn point_summary(
             let Some((distance, sigma)) = ranges_sm.get(cell).copied().flatten() else {
                 continue;
             };
-            let residual = model_distance_vec(&position_m, &mic_positions[mic]) - distance;
+            let residual = model_distance_vec(&position_m, mic_position) - distance;
             if !residual.is_finite() {
                 return None;
             }
@@ -1331,7 +1862,7 @@ fn point_summary(
             sigmas.push(sigma);
         }
     } else {
-        for source in 0..sources {
+        for (source, source_position) in source_positions.iter().enumerate() {
             let cell = source * mics + index;
             if !used_links.get(cell).copied().unwrap_or(false) {
                 continue;
@@ -1339,7 +1870,7 @@ fn point_summary(
             let Some((distance, sigma)) = ranges_sm.get(cell).copied().flatten() else {
                 continue;
             };
-            let residual = model_distance_vec(&source_positions[source], &position_m) - distance;
+            let residual = model_distance_vec(source_position, &position_m) - distance;
             if !residual.is_finite() {
                 return None;
             }
@@ -1359,7 +1890,11 @@ fn point_summary(
     };
     Some(JointPoint {
         position_m,
-        sigma_m: [sigma3.first().copied()?, sigma3.get(1).copied()?, sigma3.get(2).copied()?],
+        sigma_m: [
+            sigma3.first().copied()?,
+            sigma3.get(1).copied()?,
+            sigma3.get(2).copied()?,
+        ],
         rms_residual_m: (sum_sq / count as f64).sqrt(),
         median_sigma_m,
     })
@@ -1407,13 +1942,8 @@ mod tests {
         let source = [2.3, -1.1, 0.7];
         let ranges = exact_ranges(&mics, &source, 0.001);
         let estimate = solve_position(&mics, &ranges).expect("tetrahedron solves");
-        for axis in 0..3 {
-            assert!(
-                (estimate.position_m[axis] - source[axis]).abs() < 1.0e-9,
-                "axis {axis}: {} vs {}",
-                estimate.position_m[axis],
-                source[axis]
-            );
+        for (axis, (got, want)) in estimate.position_m.iter().zip(source.iter()).enumerate() {
+            assert!((got - want).abs() < 1.0e-9, "axis {axis}: {got} vs {want}");
         }
         assert!(!estimate.mirror_ambiguous);
         assert!(estimate.used.iter().all(|u| *u));
@@ -1604,7 +2134,7 @@ mod tests {
         let mics = cube_mics();
         let source = [2.3, -1.1, 0.7];
         let sigma = 0.005;
-        let mut rng = FixedRng(0x1_2345_6789_ABCD_EF);
+        let mut rng = FixedRng(0x123_456_789_ABC_DEF);
         let mut covered = 0_usize;
         let mut sum_sq_err = [0.0_f64; 3];
         let mut sum_sigma = [0.0_f64; 3];
@@ -1783,11 +2313,7 @@ mod tests {
 
     fn joint_max_error(estimate: &JointEstimate, sources: &[[f64; 3]], mics: &[[f64; 3]]) -> f64 {
         let mut worst = 0.0_f64;
-        for (point, truth) in estimate
-            .source_points
-            .iter()
-            .zip(sources.iter())
-        {
+        for (point, truth) in estimate.source_points.iter().zip(sources.iter()) {
             if let Some(point) = point {
                 worst = worst.max(distance(&point.position_m, truth));
             }
@@ -1805,18 +2331,16 @@ mod tests {
         let sources = joint_sources();
         let mics = joint_mics();
         let ranges = joint_ranges(&sources, &mics, 0.001);
-        let source_seeds: Vec<Option<[f64; 3]>> = vec![
-            Some(sources[0]),
-            Some(sources[1]),
-            None,
-            None,
-            None,
-        ];
-        let mic_seeds: Vec<Option<[f64; 3]>> =
-            vec![Some(mics[0]), None, None, None, None, None];
+        let source_seeds: Vec<Option<[f64; 3]>> =
+            vec![Some(sources[0]), Some(sources[1]), None, None, None];
+        let mic_seeds: Vec<Option<[f64; 3]>> = vec![Some(mics[0]), None, None, None, None, None];
         let estimate = joint_self_calibrate(&source_seeds, &mic_seeds, &ranges)
             .expect("exact joint frame calibrates");
-        assert!(estimate.mirror_ambiguous, "3 anchors leave the global mirror");
+        assert!(estimate.outlier_absorb_risk);
+        assert!(
+            estimate.mirror_ambiguous,
+            "3 anchors leave the global mirror"
+        );
         assert!(estimate.iterations < MAX_JOINT_ITERATIONS);
         assert!(estimate.used_links.iter().all(|used| *used));
         assert!(estimate.rms_residual_m < 1.0e-9);
@@ -1831,23 +2355,24 @@ mod tests {
 
     #[test]
     fn joint_noisy_errors_match_marginal_sigmas() {
-        // Fixed-seed honesty check mirroring the single-point
-        // Monte-Carlo test: every unknown's error must sit inside its
-        // joint 3σ marginal on every trial.
+        // §9 Q10b: 5 mm Gaussian range noise, 30 fixed-seed trials. Same
+        // contract as the forward Monte Carlo: joint 3-axis 3σ coverage
+        // near nominal per unknown point, and mean predicted σ within 2×
+        // of empirical RMS per axis. (An every-draw-inside-3σ assertion
+        // would false-fail: 720 draws contain a |z| > 3 tail event 86%
+        // of the time even with honest sigmas.)
         let sources = joint_sources();
         let mics = joint_mics();
         let sigma = 0.005;
-        let source_seeds: Vec<Option<[f64; 3]>> = vec![
-            Some(sources[0]),
-            Some(sources[1]),
-            None,
-            None,
-            None,
-        ];
-        let mic_seeds: Vec<Option<[f64; 3]>> =
-            vec![Some(mics[0]), None, None, None, None, None];
+        let source_seeds: Vec<Option<[f64; 3]>> =
+            vec![Some(sources[0]), Some(sources[1]), None, None, None];
+        let mic_seeds: Vec<Option<[f64; 3]>> = vec![Some(mics[0]), None, None, None, None, None];
         let mut rng = FixedRng(0x5EED_5EED_5EED_5EED);
-        for trial in 0..30 {
+        let mut covered = 0_usize;
+        let mut points = 0_usize;
+        let mut sum_sq_err = [0.0_f64; 3];
+        let mut sum_sigma = [0.0_f64; 3];
+        for _ in 0..30 {
             let ranges: Vec<Option<(f64, f64)>> = joint_ranges(&sources, &mics, sigma)
                 .into_iter()
                 .map(|range| {
@@ -1861,19 +2386,38 @@ mod tests {
                 .iter()
                 .zip(sources.iter())
                 .filter_map(|(point, truth)| point.as_ref().map(|point| (point, truth)))
-                .chain(estimate.mic_points.iter().zip(mics.iter()).filter_map(
-                    |(point, truth)| point.as_ref().map(|point| (point, truth)),
-                ))
+                .chain(
+                    estimate
+                        .mic_points
+                        .iter()
+                        .zip(mics.iter())
+                        .filter_map(|(point, truth)| point.as_ref().map(|point| (point, truth))),
+                )
             {
+                let mut inside = true;
                 for axis in 0..3 {
-                    let error = (point.position_m[axis] - truth[axis]).abs();
-                    assert!(
-                        error <= 3.0 * point.sigma_m[axis],
-                        "trial {trial} axis {axis}: error {error} sigma {}",
-                        point.sigma_m[axis]
-                    );
+                    let error = point.position_m[axis] - truth[axis];
+                    sum_sq_err[axis] += error * error;
+                    sum_sigma[axis] += point.sigma_m[axis];
+                    inside &= error.abs() <= 3.0 * point.sigma_m[axis];
                 }
+                covered += usize::from(inside);
+                points += 1;
             }
+        }
+        assert!(points == 30 * 8, "every trial estimates all 8 unknowns");
+        assert!(
+            covered >= 225,
+            "3σ coverage {covered}/{points} below the 225 bound"
+        );
+        for axis in 0..3 {
+            let rms = (sum_sq_err[axis] / f64::from(points as u32)).sqrt();
+            let mean_sigma = sum_sigma[axis] / f64::from(points as u32);
+            let ratio = rms / mean_sigma;
+            assert!(
+                (0.5..=2.0).contains(&ratio),
+                "axis {axis}: rms {rms} vs mean σ {mean_sigma} (ratio {ratio})"
+            );
         }
     }
 
@@ -1891,8 +2435,7 @@ mod tests {
         ];
         let ranges = joint_ranges(&sources, &mics, 0.001);
         let source_seeds = vec![Some(sources[0]), Some(sources[1])];
-        let mic_seeds: Vec<Option<[f64; 3]>> =
-            vec![Some(mics[0]), None, None, None];
+        let mic_seeds: Vec<Option<[f64; 3]>> = vec![Some(mics[0]), None, None, None];
         assert!(joint_self_calibrate(&source_seeds, &mic_seeds, &ranges).is_none());
     }
 
@@ -1902,14 +2445,18 @@ mod tests {
         let mics = joint_mics();
         let ranges = joint_ranges(&sources, &mics, 0.001);
         // Three anchors on a line: rotation about the line unobservable.
-        let source_seeds: Vec<Option<[f64; 3]>> =
-            vec![Some([0.0, 0.0, 0.0]), Some([1.0, 0.0, 0.0]), None, None, None];
+        let source_seeds: Vec<Option<[f64; 3]>> = vec![
+            Some([0.0, 0.0, 0.0]),
+            Some([1.0, 0.0, 0.0]),
+            None,
+            None,
+            None,
+        ];
         let mic_seeds: Vec<Option<[f64; 3]>> =
             vec![Some([2.0, 0.0, 0.0]), None, None, None, None, None];
         assert!(joint_self_calibrate(&source_seeds, &mic_seeds, &ranges).is_none());
         // Fewer than three anchors: the frame floats.
-        let mic_seeds: Vec<Option<[f64; 3]>> =
-            vec![Some(mics[0]), None, None, None, None, None];
+        let mic_seeds: Vec<Option<[f64; 3]>> = vec![Some(mics[0]), None, None, None, None, None];
         let source_seeds: Vec<Option<[f64; 3]>> = vec![None; 5];
         assert!(joint_self_calibrate(&source_seeds, &mic_seeds, &ranges).is_none());
     }
@@ -1920,15 +2467,10 @@ mod tests {
         let mics = joint_mics();
         let ranges = joint_ranges(&sources, &mics, 0.001);
         // Four non-coplanar anchors break the anchor-plane mirror.
-        let source_seeds: Vec<Option<[f64; 3]>> = vec![
-            Some(sources[0]),
-            Some(sources[1]),
-            None,
-            None,
-            None,
-        ];
+        let source_seeds: Vec<Option<[f64; 3]>> =
+            vec![Some(sources[0]), Some(sources[1]), None, None, None];
         let mic_seeds: Vec<Option<[f64; 3]>> =
-            vec![Some(mics[0]), Some(mics[4]), None, None, None, None];
+            vec![Some(mics[0]), None, None, None, Some(mics[4]), None];
         let estimate = joint_self_calibrate(&source_seeds, &mic_seeds, &ranges)
             .expect("rank-3 anchors calibrate");
         assert!(!estimate.mirror_ambiguous);
@@ -1938,27 +2480,54 @@ mod tests {
 
     #[test]
     fn joint_polish_excludes_a_wild_link() {
-        // One range corrupted by +15 cm: the polish drops the link and
-        // the frame still recovers.
+        // One range corrupted by +15 cm: the exclusion drops the link
+        // and the frame still recovers. The realistic joint geometry —
+        // surveyed microphones, unknown sources — pins both wild-link
+        // endpoints (no anchor-circle slide can absorb the lie), so the
+        // outlier sticks out at the Huber frame and the count-gated
+        // pre-hop exclusion removes it before hopping can bend onto it.
         let sources = joint_sources();
         let mics = joint_mics();
         let mut ranges = joint_ranges(&sources, &mics, 0.001);
         let wild = 2 * mics.len() + 3;
         ranges[wild] = Some((ranges[wild].expect("exact range").0 + 0.15, 0.001));
-        let source_seeds: Vec<Option<[f64; 3]>> = vec![
-            Some(sources[0]),
-            Some(sources[1]),
+        let source_seeds: Vec<Option<[f64; 3]>> = vec![None; 5];
+        let mic_seeds: Vec<Option<[f64; 3]>> = vec![
+            Some(mics[0]),
+            Some(mics[1]),
+            Some(mics[2]),
             None,
-            None,
+            Some(mics[4]),
             None,
         ];
-        let mic_seeds: Vec<Option<[f64; 3]>> =
-            vec![Some(mics[0]), None, None, None, None, None];
         let estimate = joint_self_calibrate(&source_seeds, &mic_seeds, &ranges)
             .expect("wild link drops on polish");
         assert!(!estimate.used_links[wild]);
+        assert!(!estimate.outlier_absorb_risk);
         let error = joint_max_error(&estimate, &sources, &mics);
         assert!(error < 0.02, "joint max error {error}");
+    }
+
+    #[test]
+    fn joint_thin_coverage_flags_absorb_risk() {
+        // Three anchors, one +15 cm wild link: both wild endpoints sit
+        // on null slides, so the Huber path absorbs the lie with clean
+        // residuals — no threshold can see it. The solver must say so:
+        // `outlier_absorb_risk` pins the thin-coverage path. (Error and
+        // used-links stay unasserted: a future influence stage may drop
+        // the link and recover, and this test must still pass then.)
+        let sources = joint_sources();
+        let mics = joint_mics();
+        let mut ranges = joint_ranges(&sources, &mics, 0.001);
+        let wild = 2 * mics.len() + 3;
+        ranges[wild] = Some((ranges[wild].expect("exact range").0 + 0.15, 0.001));
+        let source_seeds: Vec<Option<[f64; 3]>> =
+            vec![Some(sources[0]), Some(sources[1]), None, None, None];
+        let mic_seeds: Vec<Option<[f64; 3]>> = vec![Some(mics[0]), None, None, None, None, None];
+        let estimate = joint_self_calibrate(&source_seeds, &mic_seeds, &ranges)
+            .expect("thin coverage still calibrates");
+        assert!(estimate.outlier_absorb_risk);
+        assert!(estimate.mirror_ambiguous);
     }
 
     #[test]
@@ -1966,26 +2535,16 @@ mod tests {
         let sources = joint_sources();
         let mics = joint_mics();
         let ranges = joint_ranges(&sources, &mics, 0.002);
-        let source_seeds: Vec<Option<[f64; 3]>> = vec![
-            Some(sources[0]),
-            Some(sources[1]),
-            None,
-            None,
-            None,
-        ];
-        let mic_seeds: Vec<Option<[f64; 3]>> =
-            vec![Some(mics[0]), None, None, None, None, None];
-        let first = joint_self_calibrate(&source_seeds, &mic_seeds, &ranges)
-            .expect("first run calibrates");
+        let source_seeds: Vec<Option<[f64; 3]>> =
+            vec![Some(sources[0]), Some(sources[1]), None, None, None];
+        let mic_seeds: Vec<Option<[f64; 3]>> = vec![Some(mics[0]), None, None, None, None, None];
+        let first =
+            joint_self_calibrate(&source_seeds, &mic_seeds, &ranges).expect("first run calibrates");
         let second = joint_self_calibrate(&source_seeds, &mic_seeds, &ranges)
             .expect("second run calibrates");
         assert_eq!(first.iterations, second.iterations);
         assert_eq!(first.used_links, second.used_links);
-        for (a, b) in first
-            .source_points
-            .iter()
-            .zip(second.source_points.iter())
-        {
+        for (a, b) in first.source_points.iter().zip(second.source_points.iter()) {
             match (a, b) {
                 (Some(a), Some(b)) => assert_eq!(a.position_m, b.position_m),
                 (None, None) => {}
@@ -2040,8 +2599,7 @@ mod tests {
         let ranges = joint_ranges(&sources, &mics, 0.001);
         let source_seeds: Vec<Option<[f64; 3]>> =
             sources.iter().map(|source| Some(*source)).collect();
-        let mic_seeds: Vec<Option<[f64; 3]>> =
-            mics.iter().map(|mic| Some(*mic)).collect();
+        let mic_seeds: Vec<Option<[f64; 3]>> = mics.iter().map(|mic| Some(*mic)).collect();
         assert!(joint_self_calibrate(&source_seeds, &mic_seeds, &ranges).is_none());
     }
 }
