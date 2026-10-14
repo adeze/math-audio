@@ -59,6 +59,90 @@ pub struct GeometryRank {
     pub collinear: bool,
 }
 
+/// Leave-one-out cross-validation of a solved position.
+///
+/// For every used microphone, the position is re-solved without that
+/// microphone's range; the held-out residual measures how well the
+/// remaining geometry predicts the dropped range, and the shift measures
+/// how much the solution depended on it. A large shift flags leverage
+/// (or a mirror jump in ambiguous geometry), even when residuals look
+/// small.
+#[derive(Debug, Clone)]
+pub struct LooDiagnostics {
+    /// Largest held-out residual in metres (`|model - measured|`).
+    pub max_residual_m: f64,
+    /// Input index of the microphone with the largest residual.
+    pub worst_index: usize,
+    /// Largest solution shift in metres over the re-solves.
+    pub max_shift_m: f64,
+}
+
+/// Leave-one-out diagnostics for a solved position.
+///
+/// Re-solves once per used cell of `full` with that cell dropped;
+/// depleting drops (fewer than [`MIN_RANGES_FOR_FIX`] left) are
+/// skipped. Returns `None` when no re-solve succeeds — notably with
+/// exactly four used ranges, where every drop depletes. Total on all
+/// inputs; deterministic like the solver.
+pub fn loo_diagnostics(
+    microphones_m: &[[f64; 3]],
+    ranges_m: &[Option<(f64, f64)>],
+    full: &PositionEstimate,
+) -> Option<LooDiagnostics> {
+    if microphones_m.len() != ranges_m.len()
+        || microphones_m.is_empty()
+        || full.used.len() != ranges_m.len()
+    {
+        return None;
+    }
+    let mut ranges = ranges_m.to_vec();
+    let mut worst: Option<(usize, f64)> = None;
+    let mut max_shift_m = 0.0_f64;
+    for (index, used) in full.used.iter().enumerate() {
+        if !used {
+            continue;
+        }
+        let held = ranges[index].take();
+        let re_solved = solve_position(microphones_m, &ranges);
+        ranges[index] = held;
+        let Some(re_fit) = re_solved else {
+            continue;
+        };
+        let Some((distance, _)) = ranges_m[index] else {
+            continue;
+        };
+        let dx = re_fit.position_m[0] - microphones_m[index][0];
+        let dy = re_fit.position_m[1] - microphones_m[index][1];
+        let dz = re_fit.position_m[2] - microphones_m[index][2];
+        let residual = ((dx * dx + dy * dy + dz * dz).sqrt() - distance).abs();
+        if !residual.is_finite() {
+            continue;
+        }
+        let ex = re_fit.position_m[0] - full.position_m[0];
+        let ey = re_fit.position_m[1] - full.position_m[1];
+        let ez = re_fit.position_m[2] - full.position_m[2];
+        let shift = (ex * ex + ey * ey + ez * ez).sqrt();
+        if !shift.is_finite() {
+            continue;
+        }
+        if shift > max_shift_m {
+            max_shift_m = shift;
+        }
+        let more_residual = match worst {
+            None => true,
+            Some((_, held_residual)) => residual > held_residual,
+        };
+        if more_residual {
+            worst = Some((index, residual));
+        }
+    }
+    worst.map(|(worst_index, max_residual_m)| LooDiagnostics {
+        max_residual_m,
+        worst_index,
+        max_shift_m,
+    })
+}
+
 /// Solved source position with uncertainty and diagnostics.
 #[derive(Debug, Clone)]
 pub struct PositionEstimate {
@@ -754,6 +838,60 @@ mod tests {
                 "axis {axis}: rms {rms} vs mean σ {mean_sigma} (ratio {ratio})"
             );
         }
+    }
+
+    #[test]
+    fn loo_flags_influential_range() {
+        let mics = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [1.0, 1.0, 0.0],
+        ];
+        let source = [2.3, -1.1, 0.7];
+        let sigma = 0.001;
+        let mut ranges = exact_ranges(&mics, &source, sigma);
+        ranges[4] = Some((ranges[4].expect("exact range").0 + 3.0 * sigma, sigma));
+        let full = solve_position(&mics, &ranges).expect("six ranges solve");
+        assert!(full.used.iter().all(|used| *used));
+        let loo = loo_diagnostics(&mics, &ranges, &full).expect("spare cells diagnose");
+        assert_eq!(loo.worst_index, 4);
+        assert!(
+            loo.max_residual_m > 2.0 * sigma,
+            "residual {}",
+            loo.max_residual_m
+        );
+        assert!(loo.max_shift_m.is_finite() && loo.max_shift_m > 0.0);
+    }
+
+    #[test]
+    fn loo_empty_without_spare_cells() {
+        let mics = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let source = [2.3, -1.1, 0.7];
+        let ranges = exact_ranges(&mics, &source, 0.001);
+        let full = solve_position(&mics, &ranges).expect("tetra solves");
+        assert!(loo_diagnostics(&mics, &ranges, &full).is_none());
+    }
+
+    #[test]
+    fn loo_rejects_mismatched_inputs() {
+        let mics = cube_mics();
+        let source = [2.3, -1.1, 0.7];
+        let ranges = exact_ranges(&mics, &source, 0.001);
+        let full = solve_position(&mics, &ranges).expect("cube solves");
+        assert!(loo_diagnostics(&mics[..4], &ranges, &full).is_none());
+        let short = exact_ranges(&mics[..4], &source, 0.001);
+        assert!(loo_diagnostics(&mics, &short, &full).is_none());
+        let mut short_used = full.clone();
+        short_used.used.pop();
+        assert!(loo_diagnostics(&mics, &ranges, &short_used).is_none());
     }
 
     #[test]
