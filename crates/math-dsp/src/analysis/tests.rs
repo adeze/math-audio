@@ -1508,6 +1508,51 @@ fn test_coherence_partial_zero_energy() {
 }
 
 #[test]
+fn test_cross_correlate_envelope_fractional_delay_keeps_sign() {
+    // Regression: the parabolic vertex once mirrored fractions (37.25
+    // read as 36.75). A symmetric Hann-windowed sinc shift keeps the
+    // oracle itself unbiased; even tap counts would reintroduce the
+    // half-sample error this test guards.
+    let n = 4096;
+    let sr = 48000_u32;
+    let probe = crate::signals::gen_narrowband_probe(n, sr, 0.5, 42, 800.0, 2000.0);
+    let delay = 240.3_f64;
+    let mut recorded = vec![0.0_f32; n + 512];
+    for (n, sample) in recorded.iter_mut().enumerate() {
+        let time = n as f64 - delay;
+        if time < 0.0 || time >= probe.len() as f64 - 1.0 {
+            continue;
+        }
+        let center = time.floor() as isize;
+        let mut acc = 0.0;
+        for tap in -8..=8_isize {
+            let index = center + tap;
+            let value = if index < 0 || index >= probe.len() as isize {
+                0.0
+            } else {
+                probe[index as usize] as f64
+            };
+            let offset = time - (center + tap) as f64;
+            let sinc = if offset.abs() < 1e-9 {
+                1.0
+            } else {
+                let phase = std::f64::consts::PI * offset;
+                phase.sin() / phase
+            };
+            let window = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * (tap + 8) as f64 / 16.0).cos();
+            acc += value * sinc * window;
+        }
+        *sample = (acc * 0.3) as f32;
+    }
+    let result = cross_correlate_envelope(&probe, &recorded, sr).unwrap();
+    assert!(
+        (result.peak_sample_refined - delay).abs() < 0.2,
+        "expected {delay}, got {}",
+        result.peak_sample_refined
+    );
+}
+
+#[test]
 fn test_coherence_intermediate_value() {
     let mag = 1.0_f32;
     let phases = [-22.5_f32, -7.5, 7.5, 22.5];

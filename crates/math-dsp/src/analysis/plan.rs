@@ -214,12 +214,14 @@ pub fn cross_correlate_envelope(
         ));
     }
 
-    // Parabolic interpolation for sub-sample precision
+    // Parabolic interpolation for sub-sample precision: the vertex of
+    // the parabola through (-1, y_prev), (0, y_peak), (1, y_next). The
+    // mirrored denominator sign would reflect fractional delays.
     let peak_refined = if peak_sample > 0 && peak_sample + 1 < search_len {
         let y_prev = envelope[peak_sample - 1] as f64;
         let y_peak = envelope[peak_sample] as f64;
         let y_next = envelope[peak_sample + 1] as f64;
-        let denom = 2.0 * (2.0 * y_peak - y_prev - y_next);
+        let denom = 2.0 * (y_prev - 2.0 * y_peak + y_next);
         if denom.abs() > 1e-12 {
             peak_sample as f64 + (y_prev - y_next) / denom
         } else {
