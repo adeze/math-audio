@@ -691,6 +691,71 @@ mod tests {
         assert_eq!(first.gdop, second.gdop);
     }
 
+    /// Fixed-seed xorshift64 for the Monte-Carlo test; deterministic with
+    /// no RNG dependency.
+    struct FixedRng(u64);
+
+    impl FixedRng {
+        fn next_unit(&mut self) -> f64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            // Low 32 bits scaled into (0, 1); never exactly 0 or 1.
+            f64::from((x >> 11) as u32) / f64::from(u32::MAX) * 0.999_999 + 0.000_000_5
+        }
+
+        fn next_gaussian(&mut self) -> f64 {
+            use std::f64::consts::PI;
+            let (u1, u2) = (self.next_unit(), self.next_unit());
+            (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
+        }
+    }
+
+    #[test]
+    fn monte_carlo_errors_match_predicted_sigma() {
+        // §13.1: 5 mm Gaussian range noise, 200 fixed-seed trials. The
+        // empirical 3σ coverage must stay near nominal (joint 3-axis
+        // ≈ 99%) and the mean predicted σ within 2× of empirical RMS:
+        // the covariance has to be honest, not merely large.
+        let mics = cube_mics();
+        let source = [2.3, -1.1, 0.7];
+        let sigma = 0.005;
+        let mut rng = FixedRng(0x1_2345_6789_ABCD_EF);
+        let mut covered = 0_usize;
+        let mut sum_sq_err = [0.0_f64; 3];
+        let mut sum_sigma = [0.0_f64; 3];
+        for _ in 0..200 {
+            let ranges: Vec<Option<(f64, f64)>> = mics
+                .iter()
+                .map(|mic| Some((distance(mic, &source) + rng.next_gaussian() * sigma, sigma)))
+                .collect();
+            let estimate = solve_position(&mics, &ranges).expect("noisy trial solves");
+            let mut inside = true;
+            for axis in 0..3 {
+                let error = estimate.position_m[axis] - source[axis];
+                sum_sq_err[axis] += error * error;
+                sum_sigma[axis] += estimate.sigma_m[axis];
+                inside &= error.abs() <= 3.0 * estimate.sigma_m[axis];
+            }
+            covered += usize::from(inside);
+        }
+        assert!(
+            covered >= 195,
+            "3σ coverage {covered}/200 below the 195 bound"
+        );
+        for axis in 0..3 {
+            let rms = (sum_sq_err[axis] / 200.0).sqrt();
+            let mean_sigma = sum_sigma[axis] / 200.0;
+            let ratio = rms / mean_sigma;
+            assert!(
+                (0.5..=2.0).contains(&ratio),
+                "axis {axis}: rms {rms} vs mean σ {mean_sigma} (ratio {ratio})"
+            );
+        }
+    }
+
     #[test]
     fn geometry_rank_handles_degenerate_sets() {
         let empty: Vec<[f64; 3]> = Vec::new();
