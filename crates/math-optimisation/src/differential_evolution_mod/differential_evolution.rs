@@ -984,15 +984,17 @@ where
 
                 // Update best solution after generation
                 let (new_best_idx, new_best_f) = argmin(&energies);
-                if is_lshade {
-                    // L-SHADE reorders/shrinks the population before best selection.
-                    // Its p-best mutation does not use best_idx, but keep this
-                    // internal index valid for checkpoint validation and reporting.
-                    best_idx = new_best_idx;
-                }
                 if new_best_f < best_f {
                     best_idx = new_best_idx;
                     best_f = new_best_f;
+                    best_x.assign(&pop.row(best_idx));
+                } else if is_lshade || pop.row(best_idx) != best_x.view() {
+                    // Selection replaces on ties and L-SHADE reorders/shrinks
+                    // the population, so an equal-fitness best can lose its
+                    // tracked member. Re-pair the tracked best with a current
+                    // minimum-fitness member so barrier checkpoints stay
+                    // internally consistent.
+                    best_idx = new_best_idx;
                     best_x.assign(&pop.row(best_idx));
                 }
 

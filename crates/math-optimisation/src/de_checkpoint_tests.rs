@@ -462,3 +462,28 @@ fn rejects_identity_budget_seed_and_malformed_population_before_evaluation() {
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn plateau_objective_keeps_checkpoint_best_paired() {
+    fn plateau(_x: &Array1<f64>) -> f64 {
+        1.0
+    }
+    let mut solver =
+        DifferentialEvolution::new(&plateau, array![-2.5, -2.0], array![2.5, 2.0]).unwrap();
+    *solver.config_mut() = config(Strategy::Best1Bin, false, 42, 4);
+    let mut saved = Vec::new();
+    let mut save = |checkpoint: &DECheckpoint| {
+        saved.push(checkpoint.clone());
+        Ok(())
+    };
+    let result = solver.solve_with_checkpoint(None, "plateau-fixture-v1", Some(&mut save));
+    assert!(result.is_ok(), "plateau run failed: {:?}", result.err());
+    assert!(
+        saved.len() >= 2,
+        "expected barrier checkpoints, got {}",
+        saved.len()
+    );
+    // Every barrier checkpoint is self-validated at creation, so a saved
+    // state whose best vector was evicted by an equal-fitness trial would
+    // have aborted the run above instead of being collected here.
+}
