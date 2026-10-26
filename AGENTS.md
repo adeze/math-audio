@@ -173,5 +173,5 @@ there are no workspace `parallel`, `cli`, or `wasm` feature flags at this time.
 ## Rust Edition and Toolchain
 
 - Edition: 2024
-- Toolchain: 1.92.0 (pinned in `rust-toolchain.toml`)
+- Toolchain: stable (selected in `rust-toolchain.toml`)
 - Strict clippy lints enabled at workspace level
