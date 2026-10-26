@@ -98,6 +98,348 @@ pub struct WaterfallGrid {
     pub mags_db: Vec<Vec<f32>>,
 }
 
+/// Analysis settings for a shared spectrogram/waterfall grid without max-pooling.
+///
+/// The default 128 ms Hann window has a nominal resolution of 7.8125 Hz;
+/// zero-padding to a power of two only interpolates its spectrum. Centred
+/// windows use zero-padding at the recording edges, but frame centres never
+/// extend outside the saved impulse response. Times are relative to `direct_sample`.
+#[derive(Debug, Clone, Copy)]
+pub struct WaterfallAnalysisConfig {
+    pub window_ms: f64,
+    pub hop_ms: f64,
+    pub start_ms: f64,
+    pub end_ms: f64,
+    /// Requested output budget, capped at four million cells before allocation.
+    pub max_cells: usize,
+}
+
+impl Default for WaterfallAnalysisConfig {
+    fn default() -> Self {
+        Self {
+            window_ms: 128.0,
+            hop_ms: 4.0,
+            start_ms: 0.0,
+            end_ms: 500.0,
+            max_cells: 4_000_000,
+        }
+    }
+}
+
+/// Shared view limits; changing these does not rerun or renormalize analysis.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SharedDisplayControls {
+    pub min_hz: f64,
+    pub max_hz: f64,
+    pub start_ms: f64,
+    pub end_ms: f64,
+    pub floor_db: f64,
+    pub ceiling_db: f64,
+}
+
+/// Invalid input, unsupported analysis size, or an empty display selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaterfallError(pub &'static str);
+
+impl std::fmt::Display for WaterfallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for WaterfallError {}
+
+impl SharedDisplayControls {
+    pub fn validate(&self) -> Result<(), WaterfallError> {
+        if ![
+            self.min_hz,
+            self.max_hz,
+            self.start_ms,
+            self.end_ms,
+            self.floor_db,
+            self.ceiling_db,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+            || self.min_hz < 0.0
+            || self.max_hz <= self.min_hz
+            || self.end_ms <= self.start_ms
+            || self.ceiling_db <= self.floor_db
+        {
+            return Err(WaterfallError("invalid frequency, time, or level limits"));
+        }
+        Ok(())
+    }
+
+    /// Select the same rectangular grid for both views. Magnitudes retain the
+    /// analysis-wide reference; the renderer applies floor/ceiling as display limits.
+    pub fn crop(&self, grid: &WaterfallGrid) -> Result<WaterfallGrid, WaterfallError> {
+        self.validate()?;
+        let ordered = |axis: &[f64]| {
+            !axis.is_empty()
+                && axis.iter().all(|v| v.is_finite())
+                && axis.windows(2).all(|p| p[0] < p[1])
+        };
+        if !ordered(&grid.times_ms)
+            || !ordered(&grid.freqs_hz)
+            || grid.freqs_hz[0] < 0.0
+            || grid.mags_db.len() != grid.times_ms.len()
+            || grid
+                .mags_db
+                .iter()
+                .any(|row| row.len() != grid.freqs_hz.len() || row.iter().any(|v| !v.is_finite()))
+        {
+            return Err(WaterfallError("invalid waterfall grid axes or magnitudes"));
+        }
+        let ts = grid.times_ms.partition_point(|&t| t < self.start_ms);
+        let te = grid.times_ms.partition_point(|&t| t <= self.end_ms);
+        let fs = grid.freqs_hz.partition_point(|&f| f < self.min_hz);
+        let fe = grid.freqs_hz.partition_point(|&f| f <= self.max_hz);
+        if ts == te || fs == fe {
+            return Err(WaterfallError("display limits contain no analysis samples"));
+        }
+        Ok(WaterfallGrid {
+            times_ms: grid.times_ms[ts..te].to_vec(),
+            freqs_hz: grid.freqs_hz[fs..fe].to_vec(),
+            mags_db: grid.mags_db[ts..te]
+                .iter()
+                .map(|row| row[fs..fe].to_vec())
+                .collect(),
+        })
+    }
+}
+
+/// Checked STFT for interactive decay views. All cells share one peak reference
+/// from the complete requested analysis, before display cropping: these are
+/// relative spectral dB, not calibrated SPL or a noise-compensated decay estimate.
+/// Existing report primitives retain their legacy pooling and defaults.
+pub fn analyze_waterfall_at(
+    ir: &[f32],
+    sample_rate: f64,
+    direct_sample: usize,
+    config: &WaterfallAnalysisConfig,
+) -> Result<WaterfallGrid, WaterfallError> {
+    if ir.is_empty()
+        || ir.len() > 16_777_216
+        || direct_sample >= ir.len()
+        || ir.iter().any(|v| !v.is_finite())
+        || !sample_rate.is_finite()
+        || sample_rate <= 0.0
+        || ![
+            config.window_ms,
+            config.hop_ms,
+            config.start_ms,
+            config.end_ms,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+        || config.window_ms <= 0.0
+        || config.hop_ms <= 0.0
+        || config.end_ms <= config.start_ms
+    {
+        return Err(WaterfallError(
+            "invalid impulse response or analysis settings",
+        ));
+    }
+    let win_samples = (config.window_ms * sample_rate / 1000.0).round();
+    let hop_samples = (config.hop_ms * sample_rate / 1000.0).round();
+    if !(4.0..=262_144.0).contains(&win_samples) || !(1.0..=16_777_216.0).contains(&hop_samples) {
+        return Err(WaterfallError(
+            "analysis window or hop exceeds supported sample range",
+        ));
+    }
+    let window_len = win_samples as usize;
+    let hop = hop_samples as usize;
+    let fft_len = window_len.next_power_of_two();
+    let first = (direct_sample as f64 + config.start_ms * sample_rate / 1000.0)
+        .ceil()
+        .max(0.0);
+    let last = (direct_sample as f64 + config.end_ms * sample_rate / 1000.0)
+        .floor()
+        .min((ir.len() - 1) as f64);
+    if !first.is_finite() || !last.is_finite() || first > last {
+        return Err(WaterfallError(
+            "analysis time span does not overlap the impulse response",
+        ));
+    }
+    let first = first as usize;
+    let frame_count = (last as usize - first) / hop + 1;
+    let bin_count = fft_len / 2 + 1;
+    if frame_count
+        .checked_mul(bin_count)
+        .is_none_or(|cells| cells > config.max_cells.min(4_000_000))
+    {
+        return Err(WaterfallError(
+            "analysis grid exceeds cell budget; increase the hop or shorten the span",
+        ));
+    }
+    let window = hann_symmetric(window_len);
+    let fft = FftPlanner::new().plan_fft_forward(fft_len);
+    let mut buf = vec![Complex::new(0.0, 0.0); fft_len];
+    let mut scratch = vec![Complex::new(0.0, 0.0); fft.get_inplace_scratch_len()];
+    let mut mags_db = Vec::with_capacity(frame_count);
+    let mut times_ms = Vec::with_capacity(frame_count);
+    let mut peak = 0.0_f64;
+    for frame in 0..frame_count {
+        let centre = first + frame * hop;
+        let start = centre as i64 - (window_len / 2) as i64;
+        buf.fill(Complex::new(0.0, 0.0));
+        for (i, &weight) in window.iter().enumerate() {
+            let index = start + i as i64;
+            if index >= 0 && (index as usize) < ir.len() {
+                buf[i].re = f64::from(ir[index as usize]) * weight;
+            }
+        }
+        fft.process_with_scratch(&mut buf, &mut scratch);
+        let row: Vec<f32> = buf[..bin_count]
+            .iter()
+            .map(|v| {
+                let magnitude = v.norm();
+                peak = peak.max(magnitude);
+                if magnitude > 0.0 {
+                    (20.0 * magnitude.log10()) as f32
+                } else {
+                    f32::NEG_INFINITY
+                }
+            })
+            .collect();
+        mags_db.push(row);
+        times_ms.push((centre as f64 - direct_sample as f64) * 1000.0 / sample_rate);
+    }
+    let reference_db = if peak > 0.0 {
+        (20.0 * peak.log10()) as f32
+    } else {
+        0.0
+    };
+    for row in &mut mags_db {
+        for value in row {
+            *value = (*value - reference_db).max(WATERFALL_FLOOR_DB as f32);
+        }
+    }
+    Ok(WaterfallGrid {
+        times_ms,
+        freqs_hz: (0..bin_count)
+            .map(|bin| bin as f64 * sample_rate / fft_len as f64)
+            .collect(),
+        mags_db,
+    })
+}
+
+#[cfg(test)]
+mod shared_decay_tests {
+    use super::*;
+
+    #[test]
+    fn checked_grid_resolves_decaying_tone_and_silence_with_uniform_axes() {
+        let sr = 8000.0;
+        let ir: Vec<f32> = (0..4000)
+            .map(|i| {
+                let t = i as f64 / sr;
+                ((2.0 * std::f64::consts::PI * 250.0 * t).sin() * (-8.0 * t).exp()) as f32
+            })
+            .collect();
+        let grid = analyze_waterfall_at(&ir, sr, 0, &WaterfallAnalysisConfig::default()).unwrap();
+        assert!(*grid.times_ms.last().unwrap() <= 499.875);
+        assert!(
+            grid.times_ms
+                .windows(2)
+                .all(|w| (w[1] - w[0] - 4.0).abs() < 1e-10)
+        );
+        assert!(
+            grid.freqs_hz
+                .windows(2)
+                .all(|w| (w[1] - w[0] - 7.8125).abs() < 1e-10)
+        );
+        let bin = grid.freqs_hz.iter().position(|&f| f == 250.0).unwrap();
+        let late = grid.times_ms.iter().position(|&t| t == 300.0).unwrap();
+        let early = grid.times_ms.iter().position(|&t| t == 100.0).unwrap();
+        assert!(
+            (f64::from(grid.mags_db[late][bin] - grid.mags_db[early][bin]) + 13.8974).abs() < 0.01
+        );
+        let silence =
+            analyze_waterfall_at(&vec![0.0; 1000], sr, 0, &WaterfallAnalysisConfig::default())
+                .unwrap();
+        assert!(silence.mags_db.iter().flatten().all(|&db| db == -100.0));
+    }
+
+    #[test]
+    fn checked_grid_rejects_invalid_inputs_and_preflights_budget() {
+        let config = WaterfallAnalysisConfig::default();
+        assert!(analyze_waterfall_at(&[], 48000.0, 0, &config).is_err());
+        assert!(analyze_waterfall_at(&[f32::NAN], 48000.0, 0, &config).is_err());
+        assert!(analyze_waterfall_at(&[0.0], f64::INFINITY, 0, &config).is_err());
+        assert!(analyze_waterfall_at(&[0.0], 48000.0, 1, &config).is_err());
+        for invalid in [
+            WaterfallAnalysisConfig {
+                window_ms: f64::MAX,
+                ..config
+            },
+            WaterfallAnalysisConfig {
+                hop_ms: 0.0,
+                ..config
+            },
+            WaterfallAnalysisConfig {
+                end_ms: -1.0,
+                ..config
+            },
+            WaterfallAnalysisConfig {
+                start_ms: 1000.0,
+                end_ms: 1500.0,
+                ..config
+            },
+            WaterfallAnalysisConfig {
+                max_cells: 1,
+                ..config
+            },
+        ] {
+            assert!(analyze_waterfall_at(&[0.0; 1000], 8000.0, 0, &invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn linked_display_crop_preserves_reference_and_validates_axes() {
+        let grid = WaterfallGrid {
+            times_ms: vec![0.0, 4.0, 8.0],
+            freqs_hz: vec![0.0, 100.0, 200.0, 300.0],
+            mags_db: vec![vec![0.0, -2.0, -4.0, -8.0], vec![-10.0; 4], vec![-20.0; 4]],
+        };
+        let controls = SharedDisplayControls {
+            min_hz: 100.0,
+            max_hz: 200.0,
+            start_ms: 4.0,
+            end_ms: 8.0,
+            floor_db: -60.0,
+            ceiling_db: 0.0,
+        };
+        let cropped = controls.crop(&grid).unwrap();
+        assert_eq!(cropped.times_ms, [4.0, 8.0]);
+        assert_eq!(cropped.freqs_hz, [100.0, 200.0]);
+        assert_eq!(cropped.mags_db, [vec![-10.0; 2], vec![-20.0; 2]]);
+        assert!(
+            SharedDisplayControls {
+                min_hz: f64::NAN,
+                ..controls
+            }
+            .crop(&grid)
+            .is_err()
+        );
+        assert!(
+            SharedDisplayControls {
+                min_hz: 400.0,
+                max_hz: 500.0,
+                ..controls
+            }
+            .crop(&grid)
+            .is_err()
+        );
+        let malformed = WaterfallGrid {
+            mags_db: vec![vec![0.0]],
+            ..grid
+        };
+        assert!(controls.crop(&malformed).is_err());
+    }
+}
+
 /// One prominent resonance at the 60 ms slice.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Resonance {

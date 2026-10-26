@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## 0.5.34
 
+### Added
+
+- Checked shared spectrogram/waterfall analysis with configurable Hann window,
+  uniform axes, finite recording support and allocation limits. Shared display
+  cropping preserves the analysis-wide relative level reference. Existing
+  waterfall analysis entry points retain their behavior.
+
 ### Fixed
 
 - Added sweep specific lock detection.
