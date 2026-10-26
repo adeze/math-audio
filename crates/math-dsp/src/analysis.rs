@@ -19,16 +19,23 @@ thread_local! {
 mod analyze;
 pub mod analyzer;
 mod apply;
+mod capture_quality;
+mod common_clock;
 mod compute;
 mod estimate;
 pub mod finite_window_fir;
 mod interpolate;
 mod load;
+pub mod lsqr;
 mod measurement;
 mod microphone_compensation;
 mod misc;
+pub mod parallel_hammerstein;
 mod plan;
+pub mod polynomial_convolution;
+pub mod right_preconditioner;
 mod smooth;
+mod sweep_lag;
 #[cfg(test)]
 mod tests;
 mod types;
@@ -37,15 +44,29 @@ mod write;
 
 pub use analyze::*;
 pub use analyzer::*;
+pub use capture_quality::*;
+pub use common_clock::*;
 pub use compute::*;
 pub use estimate::*;
 pub use finite_window_fir::*;
 pub use measurement::*;
 pub use microphone_compensation::*;
 pub use misc::*;
+#[doc(inline)]
+pub use parallel_hammerstein::{
+    CapturedTrainingOutput, DesignNumericalDiagnostics, DesignNumericalStatus,
+    DesignResourceEstimate, FitRecordDiagnostics, FitSolverStop, FitUnavailable,
+    FitUnavailableReason, HeldOutRecord, ParallelHammersteinCandidate,
+    ParallelHammersteinFitOptions, ParallelHammersteinOutcome, PolynomialFitDiagnostics,
+    PolynomialFitError, PreparedParallelHammersteinDesign, QualificationStatus, SolverDiagnostics,
+    TrainingInputReference, fit_parallel_hammerstein, fit_parallel_hammerstein_reusing_design,
+    prepare_parallel_hammerstein_design,
+};
 pub(crate) use plan::deconvolve_sweep_f64_spectrum;
 pub use plan::*;
 pub use smooth::*;
+#[doc(inline)]
+pub use sweep_lag::{MIN_SWEEP_LAG_CONFIDENCE, estimate_sweep_lag_with_confidence};
 pub use types::*;
 pub use wav_analysis_config::*;
 pub use write::*;

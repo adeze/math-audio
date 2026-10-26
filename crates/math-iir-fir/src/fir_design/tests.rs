@@ -576,3 +576,55 @@ fn test_suppress_pre_ringing_main_tap_at_end() {
     assert!(ir[1].abs() <= threshold_linear + 1e-12);
     assert!(ir[2].abs() <= threshold_linear + 1e-12);
 }
+
+#[test]
+fn log_interpolation_binary_search_matches_scan_on_dense_and_boundary_queries() {
+    // Independent legacy scan is the numerical reference, including exact
+    // sample matches, endpoint extrapolation and unordered query frequencies.
+    fn reference(src: &[f64], values: &[f64], queries: &[f64]) -> Vec<f64> {
+        queries
+            .iter()
+            .map(|&frequency| {
+                if frequency <= 0.0 {
+                    return values[0];
+                }
+                let mut lower = 0;
+                let mut upper = src.len() - 1;
+                for (index, &sample) in src.iter().enumerate() {
+                    if sample <= frequency {
+                        lower = index;
+                    }
+                    if sample >= frequency && index < upper {
+                        upper = index;
+                        break;
+                    }
+                }
+                if lower == upper || src[lower] <= 0.0 || src[upper] <= 0.0 {
+                    values[lower]
+                } else {
+                    let fraction =
+                        (frequency.ln() - src[lower].ln()) / (src[upper].ln() - src[lower].ln());
+                    values[lower] + fraction * (values[upper] - values[lower])
+                }
+            })
+            .collect()
+    }
+    let frequencies: Vec<_> = (0..4096).map(|index| 0.5 + index as f64 * 0.75).collect();
+    let values: Vec<_> = frequencies
+        .iter()
+        .map(|frequency| (frequency / 100.0).ln().sin())
+        .collect();
+    let mut queries = vec![0.0, -1.0, 0.1, frequencies[0], frequencies[4095], 4000.0];
+    queries.extend((0..512).rev().map(|index| 0.25 + index as f64 * 6.0));
+    assert_eq!(
+        interpolate_log_space(&frequencies, &values, &queries),
+        reference(&frequencies, &values, &queries)
+    );
+    let duplicates = [0.0, 1.0, 1.0, 2.0, 3.0];
+    let levels = [0.0, 1.0, 2.0, 3.0, 4.0];
+    let queries = [0.0, 0.5, 1.0, 1.5, 3.0, 4.0];
+    assert_eq!(
+        interpolate_log_space(&duplicates, &levels, &queries),
+        reference(&duplicates, &levels, &queries)
+    );
+}

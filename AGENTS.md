@@ -31,7 +31,8 @@ just qa               # Full workspace QA: per-crate ladder (fmt, clippy, tests,
                       # coverage ratchet) + crate extras + workspace CI gates
 just qa-{crate}       # QA for one crate, e.g. just qa-dsp, just qa-analog,
                       # qa-autodiff, qa-convex-hull, qa-delaunay, qa-iir-fir,
-                      # qa-optimisation, qa-rir, qa-test-functions
+                      # qa-optimisation, qa-rir, qa-test-functions, qa-mathqa
+just qa-goldens       # Regenerate math-qa engine goldens (needs Wolfram)
 
 # Format and lint
 just fmt              # Format all code
@@ -52,6 +53,7 @@ cargo clippy --workspace  # Lint (strict clippy enabled in workspace)
 | `math-optimisation` | Non-linear optimisation: DE, Levenberg-Marquardt, COBYLA, ISRES, CMA-ES |
 | `math-rir` | Room Impulse Response analysis: SSIR segmentation, ISO 3382 metrics |
 | `math-test-functions` | Test functions for optimisation algorithms |
+| `math-qa` | Wolfram Engine cross-validation suite for math-audio |
 
 ### Key Dependency Flow
 
@@ -165,7 +167,6 @@ Run example suites with `just examples` (IIR/FIR, optimisation, test functions).
 Important features to know when building:
 
 - `plotly`: Plotting support for the `plot-functions` and `plot-de` binaries
-- `plotly_static`: Static PNG export (requires chromedriver)
 
 Note: `rayon` parallelism and `clap` CLI parsing are used directly where needed;
 there are no workspace `parallel`, `cli`, or `wasm` feature flags at this time.

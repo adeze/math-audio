@@ -8,11 +8,11 @@ use crate::iir::biquad::{Biquad, BiquadFilterType};
 #[test]
 fn test_bark_lambda_48khz() {
     // Smith & Abel (1999) formula: λ = 1.0674 * sqrt(2/π * arctan(0.06583 * fs)) - 0.1916
-    // At 48kHz: arctan(3159.84) ≈ π/2, so λ ≈ 1.0674 * 1.0 - 0.1916 ≈ 0.876
+    // with fs in kHz: arctan(0.06583 * 48) = arctan(3.15984).
     let lambda = bark_lambda(48000.0_f64);
     assert!(
-        (lambda - 0.876).abs() < 0.01,
-        "λ at 48 kHz should be ~0.876 (Smith & Abel), got {}",
+        (lambda - 0.766_017_000_483_164_6).abs() < 1.0e-12,
+        "λ at 48 kHz should be ~0.766 (Smith & Abel), got {}",
         lambda
     );
 }
@@ -20,10 +20,10 @@ fn test_bark_lambda_48khz() {
 #[test]
 fn test_bark_lambda_44khz() {
     let lambda: f64 = bark_lambda(44100.0);
-    // At 44.1kHz: arctan(2903) ≈ π/2, similar to 48kHz
+    // At 44.1kHz the kHz-normalized formula gives λ ≈ 0.7564.
     assert!(
-        lambda > 0.85 && lambda < 0.90,
-        "λ at 44.1 kHz should be ~0.875, got {}",
+        (lambda - 0.756_413_523_284_413_6).abs() < 1.0e-12,
+        "λ at 44.1 kHz should be ~0.7564, got {}",
         lambda
     );
 }
@@ -209,9 +209,9 @@ fn test_small_denom_clamped_f32() {
     // Issue #3: compute_implicit_consts uses an absolute 1e-15 threshold
     // that is smaller than f32::EPSILON.  For a raw denominator of ~1e-6
     // the old code returns inv_denom ≈ 1e6, which is numerically unstable.
-    let lambda = 0.876f32;
-    // Coefficients chosen so that raw_denom ≈ 1e-6 in f32 arithmetic.
-    let a1 = (1e-6f32 - 1.0f32) / lambda;
+    let lambda = 0.766f32;
+    // Coefficients chosen so that raw_denom = 1 - a1·λ ≈ 1e-6 in f32 arithmetic.
+    let a1 = (1.0f32 - 1e-6f32) / lambda;
     let (inv_denom, _) = compute_implicit_consts::<f32>(a1, 0.0f32, lambda);
     // After the fix inv_denom should be clamped to a reasonable magnitude.
     assert!(
@@ -225,9 +225,9 @@ fn test_small_denom_clamped_f32() {
 fn test_small_denom_preserves_sign_f32() {
     // When the denominator is clamped the sign must be preserved so that
     // the filter phase is not silently flipped.
-    let lambda = 0.876f32;
-    // Negative raw_denom ≈ -1e-6
-    let a1 = (-1e-6f32 - 1.0f32) / lambda;
+    let lambda = 0.766f32;
+    // Negative raw_denom = 1 - a1·λ ≈ -1e-6
+    let a1 = (1.0f32 + 1e-6f32) / lambda;
     let (inv_denom, _) = compute_implicit_consts::<f32>(a1, 0.0f32, lambda);
     assert!(
         inv_denom < 0.0,

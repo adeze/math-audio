@@ -5,7 +5,64 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## 0.5.34
+
+### Added
+
+- Checked shared spectrogram/waterfall analysis with configurable Hann window,
+  uniform axes, finite recording support and allocation limits. Shared display
+  cropping preserves the analysis-wide relative level reference. Existing
+  waterfall analysis entry points retain their behavior.
+
+### Fixed
+
+- Added sweep specific lock detection.
+
+## 0.5.33
+
+### Added
+- `generate-audio-tests` binary (moved from `sotf-tools`): generates WAV
+  test signals (id, THD/IMD tones, sweep, white/pink/M noise,
+  STIPA/full-STI) with JSON sidecars and a manifest. Signal synthesis
+  now imports `math_audio_dsp::signals` directly instead of going
+  through the `sotf-engine` re-export.
+- IEC 60268-16 direct-method STI test signals (`signals::sti`):
+  `gen_stipa_signal` / `gen_stipa_signal_seeded` (dual-modulated
+  composite) and `gen_full_sti_signal` /
+  `gen_full_sti_signal_seeded` (98 concatenated single-modulation
+  segments, modulation-major, optional silence gaps). Seeded pink
+  carriers filtered into the seven STI octaves with the same
+  zero-phase Butterworth recipe as `math_rir::bands`, standard
+  speech-spectrum weighting, active RMS normalized to 0.07.
+- Drift-correction + array primitives (`req-math-audio-capture.md`):
+  `capture_tdoa` (C1 band-limited GCC chirp TDOA with matched/PHAT
+  weighting and parabolic interpolation; C2 two-point clock skew with
+  validity flags and multi-chirp drift-series check; C4 CRB-form
+  post-correction uncertainty in microseconds, infinite when
+  uncomputable), `capture_resample` (C3 256-phase polyphase common-clock
+  resampler applying offset + skew with exact IR time origin),
+  `capture_array` (C5 LS TDOA-multilateration DOA with delay-and-sum
+  scoring; C6 geometry container, loud TDOA-vs-tape check, scale
+  self-calibration).
+- Capture multi-rate coverage: C1/C4, C3 and C5 unit tests across 6, 12,
+  44.1, 48, 88.2 and 96 kHz with rate-scaled chirp/analysis bands
+  (identical relative band, so 48 kHz defaults are unchanged).
+- RoomEQ report primitives (`req-math-audio-report.md`): `rir_early_late`
+  (envelope-peak detector, 120 Hz lowpass subwoofer reference, 20 ms
+  early/late split, fixed-centre 1/3-octave SPL), `rir_waterfall` (STFT
+  decay grid over −5…500 ms with 60 ms resonance picking and per-resonance
+  decay times), and `rir_wavelet` (3-cycle Morlet CWT heatmap, −30…0 dB).
+- Canonical ESS measurement pipeline (`analysis/measurement.rs`): lag
+  alignment with confidence, tail-aware deconvolution, Farina harmonic
+  separation, synchronous averaging with outlier rejection, and combined
+  measurement quality reports.
+- MLS deconvolution, clock-drift estimation/correction, seeded noise
+  generation, and log-frequency microphone compensation application to
+  measured responses.
+- `WavAnalysisConfig::room_slope_db` / `subwoofer`: optional end-to-end
+  log-frequency tilt (0 dB at `min_freq`, slope value at `max_freq`),
+  skipped for subwoofer measurements; exposed as `wav2csv`
+  `--room-slope-db` / `--subwoofer`.
 
 ### Fixed
 - `true_peak`: `peak` is now a running maximum over all processed samples
@@ -13,11 +70,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the `ebur128` FIR table as canonical.
 - `fdn`: saturation reporting for the ±4.0 safety clamp (plus a
   unitary-matrix validation helper) instead of silently masking instability.
+- `rir_wavelet`: magnitudes are now referenced to each heatmap's own peak
+  cell (0 dB = strongest cell), so scaling the input no longer shifts the
+  display; the unit-sine calibration is documented as not surviving this
+  display normalization. `rir_early_late` boundary handling fixed.
+- `analysis`: lag estimation now reports confidence and rejects
+  noise-only/silent recordings instead of returning an arbitrary lag.
+- `analysis`: THD now uses the un-padded sweep duration (padded playback
+  buffers previously shifted Farina harmonic offsets, silently corrupting
+  THD); IR construction uses −60 dB-relative regularization like the FR
+  path instead of an absolute 1e-20 floor.
+- `analysis`: `deconvolve_sweep` accepts recordings longer than the
+  reference (pre-roll + reverb tail) without circular tail wrap.
+- `analysis`: replaced NaN-panicking `partial_cmp().unwrap()` sites with
+  `total_cmp`; guarded `compute_thd_from_ir` against
+  `start_freq >= end_freq`.
+- `analysis::load`: tolerates truncated WAV data chunks (reads all complete
+  samples past EOF instead of failing), making `wav2csv` robust to
+  malformed files.
+- `wav2csv`: pink-compensation help corrected to +3 dB/octave for log
+  sweeps; pre-allocated buffers to minimise memory copies in analysis.
+- `simd`: fixed `compute_covariance_simd` sign bug on the AVX2 path; CI now
+  runs tests with `+avx2`.
+- `rtpghi`: fixed swapped/mis-scaled phase gradients, wrong gamma
+  (0.17 → 0.25645·M²), added relative log-magnitude threshold and phase
+  wrapping; cross-validated against phaseret (coherence 0.04 → 1.00).
+- `ebur128`: relative gate is now exactly −10 LU (was −9.309); RLB filter
+  uses consistent 48 kHz coefficients; channel weights cover 1–8 channels.
+- `analysis`: fixed inverted broadband C80 (tests rewritten); `rt60_ms` is
+  now actually milliseconds; 16/24-bit WAV normalization fixed (−96 dB bug).
+- `audio_features::chroma`: fixed transposed template masks (golden triad
+  tests added).
+- `esprit`: fixed MDL/AIC sign; auto mode now recovers 2 close tones.
+- `adaa`: ADAA2 dilog now uses the Landen identity (fixes quiet-signal
+  corruption, removes ~400 iterations/sample).
+- `replaygain`: no longer returns +∞ on silence; album gating pools then
+  gates once.
+- Closed ~15 panic/NaN paths (short-window FR, short chroma input,
+  `num_points == 1`, interleave mismatch, empty covariance range, SIMD
+  length guards, NaN envelope poisoning, lookahead latency report,
+  `DualWindowStft` latency, FDN per-line T60 gains, DC-bin consistency,
+  malformed CSV errors, f32 tone phase growth, LCG high bits, pink-noise
+  RMS).
+- `signals::sti`: fixed a time-base bug that multiplied a
+  radians-per-sample omega by seconds time, freezing the modulation
+  envelope (emitted STIPA/full-STI signals carried no modulation).
+  Both generators now phase from the sample index; emitted bytes
+  change accordingly. Regression tests demodulate the emitted
+  signals and check the sent depths (0.55 STIPA, 1.0 full-STI).
+
+### Performance
+- Faster FDW Morlet kernels (~1.7–2.5×), ReplayGain (~3.2×), peak-only
+  EBU R128 (~2.5×), ESPRIT SVD (−25%), `single_bin_dft`/`extract_tone_phase`
+  (~3.2×), IF subbands (~2.8×), psychoacoustics `from_response` (2×) and
+  `bark_spectrum` (2.6×), FFT convolution (2.4×), binaural-matrix planner
+  caching (~1.6–2.1×); spectrogram/measurement allocation storms removed.
+  All verified bit-identical or within pinned tolerance.
+- Welch spectrum, chroma STFT, and audio-feature extraction now use
+  real-to-complex FFTs with reused scratch buffers (aggregate benchmark
+  4.64 ms → 1.72 ms, results unchanged).
 
 ## [0.5.26] - 2026-07-10
 
 ### Fixed
-- `clock drift: wrong division
+- `clock drift`: wrong division
 
 ## [0.5.22] - 2026-07-10
 

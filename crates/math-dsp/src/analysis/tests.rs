@@ -390,6 +390,85 @@ fn lag_confidence_is_normalized_and_selects_the_normalized_peak() {
 }
 
 #[test]
+fn lag_confidence_quiet_tail_does_not_false_lock() {
+    // Regression test for the f32 prefix-energy absorption bug: overlap
+    // energies accumulated in f32 stagnate over the quiet tail (its
+    // per-sample squares sit far below the running total's ulp), so the
+    // overlap subtraction under-reads, the normalized correlation inflates
+    // past 1.0 (clamped to exactly 1.000), and the argmax false-locks into
+    // the tail instead of the planted sweep.
+    let sample_rate = 48_000_u32;
+    let reference = crate::signals::gen_log_sweep(20.0, 20_000.0, 0.5, sample_rate, 2.0);
+    let lead = sample_rate as usize / 2;
+    let tail_len = sample_rate as usize;
+    let mut take = vec![0.0_f32; lead + reference.len() + tail_len];
+    for (index, &sample) in reference.iter().enumerate() {
+        // Moderate plant scale plus a deterministic interferer: the honest
+        // lock then reads well under 1.0, so a clamped 1.000 can only be
+        // the absorption phantom, never the true peak.
+        let t = index as f32 / sample_rate as f32;
+        let interferer = 0.15 * (2.0 * PI * 997.0 * t).sin();
+        take[lead + index] = sample * 0.5 + interferer;
+    }
+    // Quiet tail with realistic dynamics: correlated sweep residue far
+    // below the sweep level, a decorrelating floor, and sparse peaks. A
+    // pure low-level sine would absorb to exactly zero and be skipped by
+    // the zero-energy guard; the peaks keep the f32 overlap subtraction
+    // nonzero-but-grossly-under-read, which is what inflates the phantom
+    // past 1.0 — the shape a loud sweep plus quiet room tail takes.
+    let head: Vec<f32> = reference[..tail_len].to_vec();
+    for (index, sample) in take[lead + reference.len()..].iter_mut().enumerate() {
+        let t = index as f32 / sample_rate as f32;
+        let residue = 0.006 * head[index];
+        let noise = 0.003 * (2.0 * PI * 997.0 * t).sin();
+        let impulse = if index % 4096 == 0 { 0.05 } else { 0.0 };
+        *sample = residue + noise + impulse;
+    }
+
+    let estimate = super::estimate::estimate_lag_with_confidence(&reference, &take)
+        .expect("planted sweep must lock confidently");
+    assert_eq!(estimate.lag_samples, lead as isize, "{estimate:?}");
+    assert!(
+        estimate.normalized_peak < 1.0,
+        "clamped 1.000 peak is the absorption phantom: {estimate:?}"
+    );
+    assert!(
+        estimate.normalized_peak > 0.5,
+        "expected the honest planted lock: {estimate:?}"
+    );
+}
+
+#[test]
+fn lag_confidence_partial_self_match_does_not_win() {
+    // Minimum-overlap candidacy: an exact truncated copy of the reference
+    // head reads an honest 1.0 at a partial overlap in ANY precision, so
+    // only the overlap bar (not f64) can exclude it. Pre-fix the argmax
+    // locks onto the louder partial copy; post-fix the true full-overlap
+    // lock wins on the first try (see
+    // sotf-capture/docs/bug-math-dsp-lag-f32-absorption.md).
+    let sample_rate = 48_000_u32;
+    let reference = crate::signals::gen_log_sweep(20.0, 20_000.0, 0.5, sample_rate, 2.0);
+    let plant_at = sample_rate as usize / 2;
+    // Half the reference: below the 3/4 candidacy bar.
+    let copy_len = sample_rate as usize;
+    let gap = sample_rate as usize / 2;
+    let copy_at = plant_at + reference.len() + gap;
+    let mut take = vec![0.0_f32; copy_at + copy_len];
+    for (index, &sample) in reference.iter().enumerate() {
+        let t = index as f32 / sample_rate as f32;
+        let interferer = 0.15 * (2.0 * PI * 997.0 * t).sin();
+        take[plant_at + index] = sample * 0.5 + interferer;
+    }
+    for index in 0..copy_len {
+        take[copy_at + index] = reference[index] * 0.5;
+    }
+
+    let estimate = super::estimate::estimate_lag_with_confidence(&reference, &take)
+        .expect("planted sweep must lock confidently");
+    assert_eq!(estimate.lag_samples, plant_at as isize, "{estimate:?}");
+}
+
+#[test]
 fn envelope_confidence_uses_the_envelope_peak() {
     let sample_rate = 48_000_u32;
     let probe = crate::signals::gen_narrowband_probe(1024, sample_rate, 0.5, 42, 800.0, 2_000.0);
@@ -532,60 +611,90 @@ fn clock_drift_correction_resamples_around_the_measured_lag() {
     assert!(corrected[1_010] < 0.2, "uncorrected peak remains dominant");
 }
 
+/// Timing-chirp fixture mirroring the capture_session protocol: 100 ms
+/// 2–8 kHz log sweep with 5 ms tapers.
+fn timing_chirp_fixture(sample_rate: u32) -> Vec<f32> {
+    use crate::signals::{apply_fade_in, apply_fade_out, try_gen_log_sweep};
+    let mut chirp = try_gen_log_sweep(2000.0, 8000.0, 0.5, sample_rate, 0.1).unwrap();
+    let fade = (f64::from(sample_rate) * 0.005).round() as usize;
+    apply_fade_in(&mut chirp, fade);
+    apply_fade_out(&mut chirp, fade);
+    chirp
+}
+
 #[test]
 fn clock_drift_estimator_reports_zero_for_a_stable_clock() {
-    let reference: Vec<f32> = (0..256)
-        .map(|index| ((index as f32 * 0.17).sin() + (index as f32 * 0.043).cos()) * 0.4)
-        .collect();
-    let delay = 23;
-    let mut recording = vec![0.0_f32; delay + reference.len() + 32];
-    recording[delay..delay + reference.len()].copy_from_slice(&reference);
+    // Chirp-pair drift: identical timing chirps at both take ends, no
+    // clock stretch. Coarse positions are off by +1500/−800 samples to
+    // prove the correlation windows tolerate schedule + lag-lock slop.
+    let sample_rate = 44_100_u32;
+    let chirp = timing_chirp_fixture(sample_rate);
+    let start_at = 4_410_usize;
+    let spacing = sample_rate as usize;
+    let end_at = start_at + spacing;
+    let mut take = vec![0.0_f32; end_at + chirp.len() + 4_410];
+    take[start_at..start_at + chirp.len()].copy_from_slice(&chirp);
+    take[end_at..end_at + chirp.len()].copy_from_slice(&chirp);
 
-    let estimate = super::measurement::estimate_clock_drift(&reference, &recording, 48_000)
-        .expect("a stable delayed capture should produce a drift estimate");
-    assert!(estimate.ppm.abs() < 1.0, "{estimate:?}");
-    assert!(estimate.confidence > 0.05, "{estimate:?}");
+    let estimate = super::measurement::estimate_clock_drift(
+        &chirp,
+        &take,
+        start_at + 1500,
+        end_at - 800,
+        spacing as f64,
+        sample_rate,
+    )
+    .expect("a stable chirped capture should produce a drift estimate");
+    assert!(estimate.ppm.abs() < 2.0, "{estimate:?}");
+    assert!(estimate.confidence >= 0.2, "{estimate:?}");
 }
 
 #[test]
 fn clock_drift_estimator_reports_sample_domain_ppm() {
-    let sample_rate = 44_100_u32;
-    let target_ppm = 10_000.0_f64;
-    let scale = 1.0 + target_ppm / 1_000_000.0;
-    let delay = 17_usize;
-    let reference_len = 1_024_usize;
+    // Chirp-pair drift under a known clock stretch. The injected 156.25 ppm
+    // over a 48000-sample spacing is exactly 7.5 samples of drift, so an
+    // integer-lag estimator errs by ≥10.4 ppm and the tolerance below pins
+    // the sub-sample interpolation (linear-resampling slop measured ≈0.5 ppm).
+    let sample_rate = 48_000_u32;
+    let target_ppm = 156.25_f64;
+    let scale = 1.0 - target_ppm / 1e6;
+    let chirp = timing_chirp_fixture(sample_rate);
+    let start_at = 4_800_usize;
+    let spacing = sample_rate as usize;
+    let end_at = start_at + spacing;
+    let mut take = vec![0.0_f32; end_at + chirp.len() + 4_800];
+    take[start_at..start_at + chirp.len()].copy_from_slice(&chirp);
+    take[end_at..end_at + chirp.len()].copy_from_slice(&chirp);
 
-    let reference: Vec<f32> = (0..reference_len)
-        .map(|index| {
-            let index = index as f32;
-            0.7 * (0.031 * index + 0.00001 * index * index).sin() + 0.3 * (0.097 * index).cos()
-        })
-        .collect();
-    let recording_len = delay + ((reference_len - 1) as f64 * scale).ceil() as usize + 32;
-    let mut recording = vec![0.0_f32; recording_len];
-    for (recording_index, sample) in recording.iter_mut().enumerate() {
-        let reference_position = (recording_index as f64 - delay as f64) / scale;
-        if !(0.0..=(reference_len - 1) as f64).contains(&reference_position) {
-            continue;
+    let mut drifted = vec![0.0_f32; take.len() + 4_800];
+    for (index, sample) in drifted.iter_mut().enumerate() {
+        let source = index as f64 * scale;
+        if source <= (take.len() - 1) as f64 {
+            let left = source.floor() as usize;
+            let right = (left + 1).min(take.len() - 1);
+            let fraction = (source - left as f64) as f32;
+            *sample = take[left] + fraction * (take[right] - take[left]);
         }
-        let left = reference_position.floor() as usize;
-        let right = (left + 1).min(reference_len - 1);
-        let fraction = (reference_position - left as f64) as f32;
-        *sample = reference[left] + fraction * (reference[right] - reference[left]);
     }
 
-    let estimate = super::measurement::estimate_clock_drift(&reference, &recording, sample_rate)
-        .expect("a stretched capture should produce a drift estimate");
-    let elapsed_samples = (reference_len - reference_len / 4) as f64;
-    let lag_change =
-        (estimate.end_lag_samples - estimate.start_lag_samples) as f64 - elapsed_samples;
-    let expected_ppm = lag_change / elapsed_samples * 1e6;
-
-    assert!(lag_change > 3.0 && lag_change < 15.0, "{estimate:?}");
+    // Coarse positions follow the stretched clock, ±1500 samples of slop.
+    let expected_start = (start_at as f64 / scale) as usize + 1500;
+    let expected_end = (end_at as f64 / scale) as usize - 1500;
+    let estimate = super::measurement::estimate_clock_drift(
+        &chirp,
+        &drifted,
+        expected_start,
+        expected_end,
+        spacing as f64,
+        sample_rate,
+    )
+    .expect("a stretched chirped capture should produce a drift estimate");
     assert!(
-        (estimate.ppm - expected_ppm).abs() < 1e-6,
-        "sample-domain ppm expected {expected_ppm}, got {estimate:?}"
+        (estimate.ppm - target_ppm).abs() < 4.0,
+        "expected ~{target_ppm} ppm, got {:.2} (interpolation regression?)",
+        estimate.ppm
     );
+    assert!(estimate.confidence >= 0.2, "{estimate:?}");
 }
 
 #[test]
@@ -1396,6 +1505,51 @@ fn test_coherence_partial_zero_energy() {
     assert_eq!(coh.len(), 2);
     assert!((coh[0] - 1.0).abs() < 1e-6);
     assert_eq!(coh[1], 0.0);
+}
+
+#[test]
+fn test_cross_correlate_envelope_fractional_delay_keeps_sign() {
+    // Regression: the parabolic vertex once mirrored fractions (37.25
+    // read as 36.75). A symmetric Hann-windowed sinc shift keeps the
+    // oracle itself unbiased; even tap counts would reintroduce the
+    // half-sample error this test guards.
+    let n = 4096;
+    let sr = 48000_u32;
+    let probe = crate::signals::gen_narrowband_probe(n, sr, 0.5, 42, 800.0, 2000.0);
+    let delay = 240.3_f64;
+    let mut recorded = vec![0.0_f32; n + 512];
+    for (n, sample) in recorded.iter_mut().enumerate() {
+        let time = n as f64 - delay;
+        if time < 0.0 || time >= probe.len() as f64 - 1.0 {
+            continue;
+        }
+        let center = time.floor() as isize;
+        let mut acc = 0.0;
+        for tap in -8..=8_isize {
+            let index = center + tap;
+            let value = if index < 0 || index >= probe.len() as isize {
+                0.0
+            } else {
+                probe[index as usize] as f64
+            };
+            let offset = time - (center + tap) as f64;
+            let sinc = if offset.abs() < 1e-9 {
+                1.0
+            } else {
+                let phase = std::f64::consts::PI * offset;
+                phase.sin() / phase
+            };
+            let window = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * (tap + 8) as f64 / 16.0).cos();
+            acc += value * sinc * window;
+        }
+        *sample = (acc * 0.3) as f32;
+    }
+    let result = cross_correlate_envelope(&probe, &recorded, sr).unwrap();
+    assert!(
+        (result.peak_sample_refined - delay).abs() < 0.2,
+        "expected {delay}, got {}",
+        result.peak_sample_refined
+    );
 }
 
 #[test]

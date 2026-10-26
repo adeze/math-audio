@@ -13,10 +13,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   noisy/short RIRs no longer fits noise.
 - `linear_fit_indexed` centers the time base per fit window to reduce
   subtractive cancellation in late windows.
+- `report::early_reflection_table` now measures envelope-peak prominence
+  topographically (expand left to higher ground, valley is the minimum
+  over that interval, 3 ms horizon). A fixed narrow valley both missed
+  merged reflections and admitted smoothing-ripple crests on decay tails.
 
 ### Added
+- `sti_direct` module (`requirements-stipa-direct-math-audio.md`):
+  direct-method STIPA scoring of a recorded test signal
+  (`analyze_stipa_direct` with optional loopback reference), sharing
+  the `sti` module's transmission-index and Annex A helpers. Without a
+  reference, depths compare against the 0.55 sent depth of the
+  `math-dsp` STIPA generator; a loopback reference is preferred
+  because it cancels generator coloration and sideband cutting.
+- `Iso3382Metrics::quality_verdict()` returning an `Iso3382QualityVerdict`
+  (`usable`, `decay_fits_valid`, `finite_metric_count`, `issues`),
+  aggregating the NaN-sentinel and r² acceptance checks into one verdict
+  so callers no longer assemble fit thresholds themselves.
 - Per-band ISO 3382 metrics wired through the `bands` filterbank
   (octave/third-octave with per-band fit quality).
+- `report` module with RoomEQ report primitives (`req-math-audio-report.md`):
+  `reflection_table` (1–8 kHz bandpass → envelope/peak picking < 15 ms
+  post-direct with gain vs direct, time→distance at c = 343 m/s, first-dip
+  frequency, and comb ripple) and `t60_batch` (batched octave-band T60 over
+  63 Hz–16 kHz with T30→T20→EDT fit policy and per-band validity flags
+  including a B·T60 ≥ 8 filter-ring guard).
+
+## [0.5.12]
+
+### Added
+- `sti::analyze_sti`: full indirect IR-only STI using IEC 60268-16:2020
+  Annex A weighting and redundancy, octave-band energy MTF, apparent SNR
+  limited to ±15 dB, 14 × 7 modulation/TI values and octave MTI. Invalid
+  input, inadequate Nyquist coverage and missing band energy return errors.
+  Operational noise, auditory masking and hearing thresholds are not applied.
+- Analytical exponential/echo, impulse, gain/time-shift invariance, input
+  validation and full octave-filter exponential-decay regressions.
 
 ## [0.5.6] - 2026-05-30
 

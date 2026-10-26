@@ -3,7 +3,7 @@
 //! A warped biquad replaces each unit delay (z^-1) in a standard biquad with
 //! a first-order allpass section: A(z) = (z^-1 - λ)/(1 - λz^-1).
 //!
-//! When λ ≈ 0.876 at 48 kHz, the frequency axis maps to approximate the Bark
+//! When λ ≈ 0.766 at 48 kHz, the frequency axis maps to approximate the Bark
 //! scale, concentrating filter resolution in the bass/low-mid range where room
 //! modes are most problematic.
 //!
@@ -39,7 +39,7 @@ use misc::compute_implicit_consts;
 /// axis to approximate the Bark scale (when using [`bark_lambda`] for `lambda`).
 ///
 /// With λ = 0 this degenerates to a standard biquad with identical output.
-/// With λ ≈ 0.876 (48 kHz Bark via Smith & Abel), low frequencies get
+/// With λ ≈ 0.766 (48 kHz Bark via Smith & Abel), low frequencies get
 /// finer resolution at the expense of high-frequency accuracy.
 ///
 /// # Sample-by-sample processing algorithm
@@ -56,14 +56,14 @@ use misc::compute_implicit_consts;
 ///
 /// Expanding the allpass recurrence for the y-chain:
 /// ```text
-/// (A·y)[n]  = λ·y[n] + (1−λ²)·s_y1
-/// (A²·y)[n] = λ·(A·y)[n] + (1−λ²)·s_y2
+/// (A·y)[n]  = −λ·y[n] + (1−λ²)·s_y1
+/// (A²·y)[n] = −λ·(A·y)[n] + (1−λ²)·s_y2
 /// ```
 /// Substituting and solving for y[n] gives the closed-form update:
 /// ```text
 /// ff    = b0·x + b1·(A·x)[n] + b2·(A²·x)[n]
-/// numer = ff − (1−λ²)·[(a1 + a2·λ)·s_y1 + a2·s_y2]
-/// y[n]  = numer · inv_denom        where inv_denom = 1/(1 + a1·λ + a2·λ²)
+/// numer = ff − (1−λ²)·[(a1 − a2·λ)·s_y1 + a2·s_y2]
+/// y[n]  = numer · inv_denom        where inv_denom = 1/(1 − a1·λ + a2·λ²)
 /// ```
 /// After computing y[n] the allpass states s_y1, s_y2 are advanced.
 ///
@@ -213,9 +213,9 @@ impl<T: FilterFloat> WarpedBiquad<T> {
         let ff = self.b0 * x + self.b1 * x_d1 + self.b2 * x_d2;
 
         // Closed-form solution for the implicit feedback term.
-        // Derived by substituting (A·y)[n] = λ·y[n] + (1-λ²)·s_y1 and solving.
+        // Derived by substituting (A·y)[n] = −λ·y[n] + (1-λ²)·s_y1 and solving.
         let fb_corr = self.one_minus_lam_sq
-            * ((self.a1 + self.a2 * lambda) * self.s_y1 + self.a2 * self.s_y2);
+            * ((self.a1 - self.a2 * lambda) * self.s_y1 + self.a2 * self.s_y2);
 
         let y = (ff - fb_corr) * self.inv_denom;
 
@@ -249,7 +249,7 @@ impl<T: FilterFloat> WarpedBiquad<T> {
             let x_d2 = allpass_step(x_d1, &mut ap_x2_s, lambda);
 
             let ff = b0 * x + b1 * x_d1 + b2 * x_d2;
-            let fb_corr = one_minus_lam_sq * ((a1 + a2 * lambda) * s_y1 + a2 * s_y2);
+            let fb_corr = one_minus_lam_sq * ((a1 - a2 * lambda) * s_y1 + a2 * s_y2);
 
             let y = (ff - fb_corr) * inv_denom;
 

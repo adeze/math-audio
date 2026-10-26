@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 pub struct EbuR128 {
     pub(super) channels: u32,
     #[allow(dead_code)]
-    pub(super) sample_rate: u32,
+    pub(super) sample_rate: f64,
     pub(super) mode: Mode,
 
     // K-weighting filters (one per channel)
@@ -45,26 +45,29 @@ impl EbuR128 {
     /// Create a new EBU R128 loudness meter.
     ///
     /// # Errors
-    /// Returns an error if channels is 0 or if the sample rate is outside
+    /// Returns an error if channels is 0 or if the finite sample rate is outside
     /// the libebur128-validated range 16..=2822400 Hz. (Below 16 Hz the
     /// 100 ms sub-block would contain 0 frames and produce NaN energies.)
-    pub fn new(channels: u32, sample_rate: u32, mode: Mode) -> Result<Self, String> {
+    pub fn new<S: Into<f64>>(channels: u32, sample_rate: S, mode: Mode) -> Result<Self, String> {
+        let sample_rate = sample_rate.into();
         if channels == 0 {
             return Err("channels must be > 0".into());
         }
-        if !(16..=2_822_400).contains(&sample_rate) {
+        if !sample_rate.is_finite() || !(16.0..=2_822_400.0).contains(&sample_rate) {
             return Err(format!(
                 "sample_rate must be in 16..=2822400 Hz, got {sample_rate}"
             ));
         }
         let nc = channels as usize;
-        let sub_block_frames = (sample_rate as usize) / 10; // 100ms
+        let sub_block_frames = (sample_rate / 10.0).floor() as usize; // whole frames near 100ms
 
         let filters: Vec<KWeightFilter> =
             (0..nc).map(|_| KWeightFilter::new(sample_rate)).collect();
         let channel_weights: Vec<f64> = (0..nc).map(|ch| channel_weight(ch, nc)).collect();
 
-        if mode.has(Mode::TRUE_PEAK) && sample_rate != TRUE_PEAK_FIR_REFERENCE_SAMPLE_RATE {
+        if mode.has(Mode::TRUE_PEAK)
+            && sample_rate != f64::from(TRUE_PEAK_FIR_REFERENCE_SAMPLE_RATE)
+        {
             log::warn!(
                 "EbuR128 true-peak mode uses the BS.1770-4 48 kHz FIR table; \
                  sample_rate={sample_rate} true-peak results are approximate"
@@ -89,9 +92,9 @@ impl EbuR128 {
             momentary_ring: SubBlockRing::new(4), // 4 × 100ms = 400ms
             shortterm_ring: SubBlockRing::new(30), // 30 × 100ms = 3s
             gating_blocks: if mode.has(Mode::I) {
-                // Pre-allocate for ~10 minutes (6000 blocks at 10 blocks/sec)
-                // to avoid re-allocations on the audio thread hot path.
-                VecDeque::with_capacity(6_000)
+                // Prepare the complete rolling window so push_back never grows
+                // storage on the audio thread, including after ten minutes.
+                VecDeque::with_capacity(MAX_GATING_BLOCKS)
             } else {
                 VecDeque::new()
             },
@@ -302,6 +305,20 @@ impl EbuR128 {
         let val = self.prev_sample_peak[ch];
         self.prev_sample_peak[ch] = 0.0;
         Ok(val)
+    }
+
+    /// Complete the true-peak FIR response at the end of a finite segment.
+    ///
+    /// Flushes eleven zero-input intervals through only the interpolation filter.
+    /// Loudness clocks, K-weighting, gating and sample peaks are unchanged. Peaks
+    /// remain available to `prev_true_peak`; repeated calls add no response.
+    /// Later input starts a new interpolation segment within the current loudness
+    /// epoch. Does nothing when `Mode::TRUE_PEAK` is disabled. This operation is
+    /// bounded and allocation-free.
+    pub fn finish_true_peak(&mut self) {
+        if let Some(detector) = &mut self.true_peak_detector {
+            detector.finish();
+        }
     }
 
     /// Previous true peak for a given channel (since last snapshot).

@@ -187,11 +187,12 @@ pub struct CrossCorrelationEnvelopeResult {
 pub struct LagEstimate {
     /// Positive values mean that the recording starts later than the reference.
     pub lag_samples: isize,
-    /// Normalised cross-correlation at the selected lag.
+    /// Normalized correlation peak; the sweep estimator uses its analytic envelope.
     pub normalized_peak: f32,
     /// Peak-to-sidelobe ratio in dB.
     pub peak_to_sidelobe_db: f32,
-    /// Combined bounded confidence score in the range `[0, 1]`.
+    /// Method-specific bounded detection score in `[0, 1]`, not a probability.
+    /// See the chosen estimator for its normalization and acceptance threshold.
     pub confidence: f32,
 }
 

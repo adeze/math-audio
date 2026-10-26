@@ -10,7 +10,7 @@ use super::interpolate::interpolate_log;
 use super::interpolate::interpolate_log_phase;
 use super::load::load_wav_mono;
 use super::load::load_wav_mono_with_rate;
-use super::measurement::analyze_ess_recording;
+use super::measurement::{analyze_ess_recording, analyze_ess_recording_with_lag};
 use super::misc::generate_log_frequencies;
 use super::misc::next_power_of_two;
 use super::misc::wav_next_power_of_two;
@@ -18,6 +18,7 @@ use super::plan::plan_fft_inverse;
 use super::plan::plan_real_fft_forward;
 use super::types::AnalysisResult;
 use super::types::EssAnalysisResult;
+use super::types::LagEstimate;
 use super::types::WavAnalysisOutput;
 use super::types::WindowType;
 use super::wav_analysis_config::WavAnalysisConfig;
@@ -289,6 +290,45 @@ pub fn analyze_recording(
     sample_rate: u32,
     sweep_range: Option<(f32, f32)>,
 ) -> Result<AnalysisResult, String> {
+    analyze_recording_at_lag(
+        recorded_path,
+        reference_signal,
+        sample_rate,
+        sweep_range,
+        None,
+    )
+}
+
+/// Analyze a recording using the capture gate's accepted lag.
+///
+/// The estimate must describe the same reference and recorded samples. Already
+/// aligned repeat averages must supply zero lag. Detection never changes samples.
+///
+/// # Errors
+/// Returns an error for unreadable audio, invalid samples, or invalid timing.
+pub fn analyze_recording_with_lag(
+    recorded_path: &Path,
+    reference_signal: &[f32],
+    sample_rate: u32,
+    sweep_range: Option<(f32, f32)>,
+    lag: LagEstimate,
+) -> Result<AnalysisResult, String> {
+    analyze_recording_at_lag(
+        recorded_path,
+        reference_signal,
+        sample_rate,
+        sweep_range,
+        Some(lag),
+    )
+}
+
+fn analyze_recording_at_lag(
+    recorded_path: &Path,
+    reference_signal: &[f32],
+    sample_rate: u32,
+    sweep_range: Option<(f32, f32)>,
+    accepted_lag: Option<LagEstimate>,
+) -> Result<AnalysisResult, String> {
     // Load recorded WAV
     log::debug!("[FFT Analysis] Loading recorded file: {:?}", recorded_path);
     let recorded = load_wav_mono(recorded_path)?;
@@ -309,7 +349,16 @@ pub fn analyze_recording(
     }
 
     if let Some(sweep_range) = sweep_range {
-        let ess = analyze_ess_recording(&recorded, reference_signal, sample_rate, sweep_range)?;
+        let ess = match accepted_lag {
+            Some(lag) => analyze_ess_recording_with_lag(
+                &recorded,
+                reference_signal,
+                sample_rate,
+                sweep_range,
+                lag,
+            )?,
+            None => analyze_ess_recording(&recorded, reference_signal, sample_rate, sweep_range)?,
+        };
         return Ok(analysis_result_from_ess(ess, sample_rate));
     }
 
@@ -369,7 +418,10 @@ pub fn analyze_recording(
     }
 
     // Estimate lag using cross-correlation
-    let lag_estimate = estimate_lag_with_confidence(reference, recorded)?;
+    let lag_estimate = match accepted_lag {
+        Some(lag) => lag,
+        None => estimate_lag_with_confidence(reference, recorded)?,
+    };
     let lag = lag_estimate.lag_samples;
 
     log::debug!(

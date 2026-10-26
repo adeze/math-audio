@@ -6,7 +6,7 @@ DSP utilities for signal generation, analysis, and audio feature extraction.
 
 | Module | Description |
 |---|---|
-| `signals` | Signal generation: sine, two-tone, log sweep, white/pink/M noise, fade, padding, channel utils |
+| `signals` | Signal generation: sine, two-tone, log sweep, white/pink/M noise, STIPA/full-STI, fade, padding, channel utils |
 | `analysis` | FFT-based frequency analysis (Welch/single-FFT), acoustic metrics (RT60, C50/C80, THD), microphone compensation, CSV I/O |
 | `simd` | SIMD-optimized DSP operations |
 | `stft` | Short-Time Fourier Transform |
@@ -24,6 +24,7 @@ DSP utilities for signal generation, analysis, and audio feature extraction.
 
 ## Binaries
 
+- `generate-audio-tests` -- Generate WAV test signals + JSON sidecars for validation
 - `wav2csv` -- Convert WAV files to CSV (frequency/SPL/phase)
 - `simd-fuzzer` -- SIMD fuzzing test tool
 

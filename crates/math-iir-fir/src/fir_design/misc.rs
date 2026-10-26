@@ -44,20 +44,15 @@ pub(super) fn interpolate_log_space(
 
         let log_f = f.ln();
 
-        // Find bracketing indices in source
-        let mut lower_idx = 0;
-        let mut upper_idx = src_freqs.len() - 1;
-
-        // Binary search for position
-        for (i, &sf) in src_freqs.iter().enumerate() {
-            if sf <= f {
-                lower_idx = i;
-            }
-            if sf >= f && i < upper_idx {
-                upper_idx = i;
-                break;
-            }
-        }
+        // Frequency-response design requires an ordered source grid. Search
+        // the first value >= f instead of rescanning a dense FFT source grid.
+        let last = src_freqs.len() - 1;
+        let upper_idx = src_freqs.partition_point(|sf| *sf < f).min(last);
+        let lower_idx = if src_freqs[upper_idx] <= f {
+            upper_idx
+        } else {
+            upper_idx.saturating_sub(1)
+        };
 
         if lower_idx == upper_idx || src_freqs[lower_idx] <= 0.0 || src_freqs[upper_idx] <= 0.0 {
             result.push(src_values[lower_idx]);
