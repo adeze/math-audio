@@ -13,7 +13,7 @@ use math_audio_dsp::capture_tdoa::{
     post_correction_uncertainty_us,
 };
 use math_audio_dsp::signals::gen_log_sweep;
-use math_qa::{QaResult, assert_close, assert_close_abs, emit_result, provenance, reference};
+use math_qa::{NormalizedErrors, assert_close, assert_close_abs, reference};
 
 const CASE: &str = "capture_tdoa";
 const CASE_ID: &str = "math-qa.capture-tdoa.v1";
@@ -73,8 +73,9 @@ fn wolfram_capture_tdoa() {
         return;
     };
     assert_eq!(ref_json["case"], CASE_ID);
-    let mut max_err = 0.0f64;
-    let mut max_tol = 0.0f64;
+    // Combine different units as fractions of their unchanged oracle tolerances.
+    // A ratio of one is the acceptance boundary for every comparison.
+    let mut errors = NormalizedErrors::new(CASE_ID);
 
     // C1: per-rate chirp band, own delay application; the engine
     // estimated the same true delays independently at the same rate.
@@ -91,7 +92,6 @@ fn wolfram_capture_tdoa() {
         let tol: f64 = serde_json::from_value(entry["offset_tolerance"].clone()).unwrap();
         let conf_tol: f64 =
             serde_json::from_value(entry["confidence_tolerance_db"].clone()).unwrap();
-        max_tol = max_tol.max(tol);
         // The FIR oracle handles negative delays natively (advance with
         // zero fill, same as the in-crate C1 oracle); no padding needed.
         let recorded = fractional_delay(&reference, delay);
@@ -105,7 +105,7 @@ fn wolfram_capture_tdoa() {
             tol,
             &format!("C1 offset at {sr} Hz delay {delay}"),
         );
-        max_err = max_err.max(err / tol);
+        errors.record("offset", err);
         let expected_conf: f64 = serde_json::from_value(entry["confidence_db"].clone()).unwrap();
         assert_close_abs(
             est.confidence_db,
@@ -113,6 +113,7 @@ fn wolfram_capture_tdoa() {
             conf_tol,
             &format!("C1 confidence at {sr} Hz delay {delay}"),
         );
+        errors.record("confidence", (est.confidence_db - expected_conf).abs());
     }
 
     // C2: skew arithmetic from the oracle's chirp pair (rate-free).
@@ -122,7 +123,6 @@ fn wolfram_capture_tdoa() {
         let d1: f64 = serde_json::from_value(entry["offset_samples"].clone()).unwrap();
         let ppm: f64 = serde_json::from_value(entry["skew_ppm"].clone()).unwrap();
         let tol: f64 = serde_json::from_value(entry["tolerance"].clone()).unwrap();
-        max_tol = max_tol.max(tol);
         let spacing = 480_000.0;
         let d2 = d1 + ppm * spacing / 1e6;
         let mk = |o: f64| TdoaEstimate {
@@ -134,7 +134,7 @@ fn wolfram_capture_tdoa() {
         assert!(skew.valid);
         let err = math_qa::rel_error(skew.skew_ppm, ppm);
         assert_close(skew.skew_ppm, ppm, tol, "C2 skew_ppm");
-        max_err = max_err.max(err);
+        errors.record("skew", err);
     }
 
     // C4: bound evaluation against the oracle's formula value, per rate.
@@ -166,7 +166,7 @@ fn wolfram_capture_tdoa() {
             post_correction_uncertainty_us(&mk(20.0), &mk(14.0), &skew, spacing, eval, &config);
         let err = math_qa::rel_error(got, expected);
         assert_close(got, expected, tol, &format!("C4 uncertainty_us at {sr} Hz"));
-        max_err = max_err.max(err);
+        errors.record("uncertainty", err);
     }
     // C4 invalid flag → infinite, never zero.
     let bad = TdoaEstimate {
@@ -185,11 +185,5 @@ fn wolfram_capture_tdoa() {
     let inf = post_correction_uncertainty_us(&bad, &bad, &skew, 480_000.0, 0.0, &config);
     assert!(inf.is_infinite() && inf > 0.0);
 
-    emit_result(&QaResult {
-        case: CASE_ID.to_string(),
-        pass: true,
-        max_rel_error: max_err,
-        tolerance: max_tol,
-        provenance: provenance(),
-    });
+    errors.emit(CASE_ID, &ref_json);
 }

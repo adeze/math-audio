@@ -20,6 +20,23 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # .cargo/config.toml links Linux x86_64 with clang + -fuse-ld=mold,
+      # which are not preinstalled on ubuntu-latest.
+      - name: Install clang and mold linker
+        timeout-minutes: 10
+        # apt mirrors on shared runners intermittently hang; bound each
+        # attempt and retry instead of stalling the job for hours.
+        run: |
+          for attempt in 1 2 3; do
+            if sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update \
+              && sudo apt-get install -y clang mold; then
+              exit 0
+            fi
+            echo "apt attempt $attempt failed; retrying"
+            sleep 15
+          done
+          exit 1
+
       - name: Cache cargo registry
         uses: actions/cache@v5
         with:
@@ -39,13 +56,41 @@ jobs:
         run: cargo test --lib --release
 
   avx2-tests:
-    name: AVX2 SIMD Tests (math-dsp, x86_64)
+    name: SIMD Tests (DSP/FIR, x86_64, ${{ matrix.label }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: "+avx2,+fma"
+            slug: avx2-fma
+            features: "+avx2,+fma"
+          - label: "+avx2,-fma"
+            slug: avx2-nofma
+            features: "+avx2,-fma"
+          - label: "-avx2,-fma"
+            slug: noavx2-nofma
+            features: "-avx2,-fma"
     steps:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install clang and mold linker
+        timeout-minutes: 10
+        # apt mirrors on shared runners intermittently hang; bound each
+        # attempt and retry instead of stalling the job for hours.
+        run: |
+          for attempt in 1 2 3; do
+            if sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update \
+              && sudo apt-get install -y clang mold; then
+              exit 0
+            fi
+            echo "apt attempt $attempt failed; retrying"
+            sleep 15
+          done
+          exit 1
 
       - name: Cache cargo registry
         uses: actions/cache@v5
@@ -54,20 +99,26 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-avx2-${{ hashFiles('**/Cargo.lock') }}
+          # Cache keys cannot contain commas, so use the comma-free slug
+          # instead of the raw feature list.
+          key: ${{ runner.os }}-cargo-simd-${{ matrix.slug }}-${{ hashFiles('**/Cargo.lock') }}
 
       # Compile-only gate: guarantees the AVX2 kernels build even if the
       # runner's CPU support ever changes.
-      - name: cargo check math-dsp with AVX2
-        run: cargo check -p math-dsp --all-targets
+      - name: cargo check DSP and FIR feature paths
+        run: cargo check -p math-dsp -p math-iir-fir --all-targets
         env:
-          RUSTFLAGS: -C target-feature=+avx2
+          RUSTFLAGS: -C target-feature=${{ matrix.features }}
 
       # ubuntu-latest runners support AVX2, so the kernels are executed.
-      - name: cargo test math-dsp with AVX2
-        run: cargo test -p math-dsp
+      - name: cargo test DSP and FIR feature paths
+        run: cargo test -p math-dsp -p math-iir-fir --release
         env:
-          RUSTFLAGS: -C target-feature=+avx2
+          RUSTFLAGS: -C target-feature=${{ matrix.features }}
+
+      - name: Historical FIR negative controls
+        if: matrix.slug == 'avx2-fma'
+        run: python3 qa/fir-negative-controls/run.py
 
   qa:
     name: Workspace QA
@@ -83,6 +134,21 @@ jobs:
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Install clang and mold linker
+        timeout-minutes: 10
+        # apt mirrors on shared runners intermittently hang; bound each
+        # attempt and retry instead of stalling the job for hours.
+        run: |
+          for attempt in 1 2 3; do
+            if sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update \
+              && sudo apt-get install -y clang mold; then
+              exit 0
+            fi
+            echo "apt attempt $attempt failed; retrying"
+            sleep 15
+          done
+          exit 1
 
       - name: Cache cargo registry
         uses: actions/cache@v6
@@ -114,6 +180,21 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      - name: Install clang and mold linker
+        timeout-minutes: 10
+        # apt mirrors on shared runners intermittently hang; bound each
+        # attempt and retry instead of stalling the job for hours.
+        run: |
+          for attempt in 1 2 3; do
+            if sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update \
+              && sudo apt-get install -y clang mold; then
+              exit 0
+            fi
+            echo "apt attempt $attempt failed; retrying"
+            sleep 15
+          done
+          exit 1
+
       - name: Cache cargo registry
         uses: actions/cache@v5
         with:
@@ -125,4 +206,6 @@ jobs:
 
       - name: Run coverage gate
         # Keep in sync with the `qa` recipe in Justfile (bins included).
-        run: cargo llvm-cov --summary-only --release --fail-under-lines 81 --ignore-filename-regex 'rustlib/src/rust|registry/src'
+        run: |
+          cargo llvm-cov clean --workspace
+          CARGO_PROFILE_RELEASE_OPT_LEVEL=0 cargo llvm-cov --summary-only --release --fail-under-lines 81 --ignore-filename-regex 'rustlib/src/rust|registry/src'

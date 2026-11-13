@@ -72,8 +72,11 @@ fn wolfram_morlet_spots() {
     emit_result(&QaResult {
         case: CASE_ID.to_string(),
         pass: true,
-        max_rel_error: worst,
+        metric: "spot_absolute_error".to_string(),
+        unit: "dB".to_string(),
+        error: worst,
         tolerance: TOL_DB,
+        allowance_sha256: math_qa::allowance_digest(&ref_json).expect("numeric oracle allowances"),
         provenance: provenance(),
     });
 }

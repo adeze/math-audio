@@ -7,6 +7,18 @@ Per-crate details live in `crates/<name>/CHANGELOG.md`.
 
 Work present in the tree but not yet committed or released:
 
+- `math-rir`: early-reflection picker threshold now lives in the envelope
+  domain (relative to the direct burst's envelope peak instead of its
+  waveform peak). The old comparison rejected every reflection in sparse
+  deconvolved IRs, whose direct envelope sits far below its peak; gains
+  remain reported relative to the direct peak.
+- `math-rir`: the STIPA analytical-MTF test no longer effectively hangs
+  in debug builds: its fixture convolution is FFT-based (was a naive
+  ~5e9-operation double loop per channel) and the 64 independent channel
+  realizations run in parallel via rayon. Assertions, realization count,
+  and tolerances are unchanged; the test now completes in ~1 minute in
+  debug instead of running for tens of minutes.
+
 - `math-optimisation`: SACOBRA-style `cobra` surrogate constrained
   optimiser, single-trust-region constrained BO arm, shared
   `RbfSurrogate` models, CMA-ES native inequality constraints with
@@ -19,6 +31,44 @@ Work present in the tree but not yet committed or released:
 - `math-analog`: Shockley diode-clipper, Koren-12AX7A triode-stage, and
   Yeh FMV tone-stack component models (IDs 6–8) with the
   `component_report` characterization example.
+
+## [0.5.5] - 2026-10-31
+
+Follow-up fixes from the review of the 2026-10-18 audit implementation:
+
+- `math-qa`: the comparison record gate now rejects records whose
+  `max_rel_error` exceeds their recorded tolerance instead of trusting
+  the self-reported pass flag.
+- `math-rir`: decay fits reject r² < 0.95 and use the slower upper-half
+  decay rate for the omitted-tail headroom estimate; default band
+  analysis bounds live workspaces by worker parallelism rather than
+  band count, and the retained-workspace figure is asserted in tests.
+- `math-iir-fir`: `FilterFloat` is sealed to `f32`/`f64`, so downstream
+  numeric types can no longer reach primitive-specific SIMD dispatch.
+- `math-dsp`: median selection defines NaN ordering via `total_cmp`;
+  subnormal clarity and true-peak regressions now assert against
+  independent oracles with a tightened 0.25 dB true-peak bound.
+- `math-analog`: small-callback wall-median timing is asserted by
+  default (p95/worst remain opt-in for isolated runners).
+
+## [0.5.4] - 2026-10-18
+
+- Implemented the code audit's DSP correctness fixes: sound FIR SIMD type/feature
+  boundaries, exact custom taps, whole-program and near-threshold loudness,
+  decay-fit headroom, FIR true peaks, clarity invariance, and complete STFT streams.
+- Driven small-buffer validation also exposed incorrect held triode plate values
+  after grid jumps. The triode solver now uses an analytic derivative and
+  safeguarded monotone root bracket, checked against independent f64 bisection.
+- Added prepared/reusable FIR, Welch, common-clock resampling, filtfilt, and decay
+  APIs; reduced median-selection work and bounded multiband workspace concurrency.
+- Made required QA references fail visibly and verified executed comparison
+  records against the complete manifest. Isolated hull exports and strengthened
+  numerical, allocation, callback-size, and maintained benchmark coverage.
+- Versions: math-dsp 0.5.35, math-iir-fir 0.5.27, math-rir 0.5.13,
+  math-qa 0.5.4, math-analog 0.5.5, math-convex-hull 0.3.4.
+- Broadband clarity now infers arrival by default; use the new explicit-start API
+  for an existing array-origin convention. True-peak reconstruction has FIR delay
+  and finite-tail completion. Unsupported decay fits now return no measurement.
 
 ## math-rir 0.5.12
 

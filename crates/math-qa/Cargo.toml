@@ -1,6 +1,6 @@
 [package]
 name = "math-qa"
-version = "0.5.3"
+version = "0.5.5"
 edition = { workspace = true }
 authors = { workspace = true }
 description = "Quality assurance suite: Wolfram Engine cross-validation for math-audio"
@@ -19,6 +19,7 @@ math-iir-fir = { workspace = true }
 math-rir = { workspace = true }
 math-test-functions = { workspace = true }
 num-complex = { workspace = true }
+sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

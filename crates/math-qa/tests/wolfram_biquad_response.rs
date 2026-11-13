@@ -42,8 +42,11 @@ fn wolfram_biquad_response() {
     emit_result(&QaResult {
         case: CASE_ID.to_string(),
         pass: true,
-        max_rel_error: max_err,
+        metric: "complex_response_relative_error".to_string(),
+        unit: "ratio".to_string(),
+        error: max_err,
         tolerance: TOL,
+        allowance_sha256: math_qa::allowance_digest(&ref_json).expect("numeric oracle allowances"),
         provenance: provenance(),
     });
 }

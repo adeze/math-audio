@@ -39,6 +39,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   63 Hz–16 kHz with T30→T20→EDT fit policy and per-band validity flags
   including a B·T60 ≥ 8 filter-ring guard).
 
+## [0.5.14] - 2026-10-31
+
+### Fixed
+- `DecayCurve::fit_db_range` rejects window fits with r² < 0.95 (the
+  ISO 3382-1 acceptance threshold), so double-slope decays and late
+  reflection clusters inside the window no longer yield a biased
+  single-slope reverberation time. The omitted-tail headroom estimate
+  now uses the slower of the full-window and upper-half decay rates.
+- `analyze_iso3382_bands` bounds live band workspaces by worker
+  parallelism instead of allocating one retained context per band;
+  results and band order are unchanged. The 36 bytes/sample retained
+  workspace model is asserted by the allocation tests.
+
+## [0.5.13] - 2026-10-18
+
+### Fixed
+- Decay fits reject insufficient tail-energy headroom even when a truncated
+  record produces a high r². The documented 10 dB check returns no fit instead
+  of a biased T30; it does not claim to compensate missing decay energy.
+
+### Performance and tests
+- Band filtering borrows reusable filtfilt output without an intermediate copy.
+- `DecayWorkspace::compute` retains and lends curve samples across calls;
+  internal ISO analysis uses the borrowed result.
+- `analyze_iso3382_bands_with_pool` bounds concurrent long-record workspaces.
+- Added duration/SNR/rate/gain regressions, long-record allocation accounting,
+  pool equivalence tests, and record-length/pool-size benchmarks.
+
 ## [0.5.12]
 
 ### Added

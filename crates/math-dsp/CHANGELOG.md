@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.36] - 2026-10-31
+
+### Fixed
+- Median selection in tonal/transient separation defines non-finite
+  ordering via `total_cmp` (NaN last) instead of the legacy partial
+  sort's unspecified NaN placement.
+- Audit regressions strengthened: subnormal clarity asserts against an
+  independent stored-sample oracle, and the true-peak sine oracle bound
+  tightened from 0.6 dB to 0.25 dB.
+
+## [0.5.35] - 2026-10-18
+
+### Fixed
+- Whole-program integrated loudness retains every above-absolute-gate block past
+  one hour; the relative pass and album energy also enforce the absolute gate.
+  Exact history uses about 80 bytes/second of accepted audio; callers can reserve
+  the known program length before callbacks with `reserve_gating_blocks`.
+- Standalone true-peak detection uses the shared BS.1770 polyphase FIR instead of
+  cubic interpolation and exposes finite-record tail completion. Reconstruction
+  remains approximate; the reference table targets 48 kHz input.
+- Broadband clarity accumulates f64 energy without absolute low-level gates and
+  anchors at the first significant arrival. `compute_clarity_broadband_at` retains
+  explicit timing control, including array-origin measurements with start zero.
+- STFT zero-padding reconstructs startup samples at the existing N-1 latency;
+  `finish_into` drains finite records and resets without allocating.
+
+### Performance and tests
+- `SpectrumAnalyzer::welch_into` writes into caller-owned output buffers.
+- `CommonClockResampler` reuses a flattened coefficient table across channels;
+  phase-independent Kaiser coefficients are computed once per preparation.
+- Median separation uses selection instead of quadratic partial sorting and
+  multiplies for its default squared masks.
+- Added numerical boundary regressions, allocation contracts, and maintained
+  Welch/resampler/STFT/separation benchmarks.
+
 ## 0.5.34
 
 ### Added

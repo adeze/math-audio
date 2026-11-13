@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 /// Relative error `|a − b| / |b|` with deterministic zero handling: 0 when
 /// both are zero (or both non-finite-equal), ∞ when only the reference is
@@ -93,8 +94,12 @@ pub fn wolfram_script(name: &str) -> PathBuf {
 }
 
 /// Reference payload for a case: live engine output when `WOLFRAMSCRIPT`
-/// is set, otherwise the checked-in golden. Returns `None` (loudly) when
-/// neither is available so tests skip instead of failing blind.
+/// is set, otherwise the checked-in golden.
+///
+/// # Panics
+/// Panics when the selected reference is missing, unreadable, or invalid.
+/// The optional return type is retained for source compatibility; success
+/// always returns `Some`. Required comparisons never silently skip.
 pub fn reference(case: &str, script: &str) -> Option<serde_json::Value> {
     match env::var_os("WOLFRAMSCRIPT") {
         Some(executable) => run_wolfram_script_with(&executable, script),
@@ -103,7 +108,10 @@ pub fn reference(case: &str, script: &str) -> Option<serde_json::Value> {
 }
 
 /// [`reference`] against an explicit golden directory (no env lookup), so
-/// the golden/skip branches are unit-testable without touching process env.
+/// reference branches are unit-testable without touching process env.
+///
+/// # Panics
+/// Panics if the golden is missing, unreadable, or invalid JSON.
 pub fn reference_with(case: &str, golden_dir: &std::path::Path) -> Option<serde_json::Value> {
     let path = golden_dir.join(format!("{case}.json"));
     match std::fs::read_to_string(&path) {
@@ -111,18 +119,19 @@ pub fn reference_with(case: &str, golden_dir: &std::path::Path) -> Option<serde_
             serde_json::from_str(&text)
                 .unwrap_or_else(|error| panic!("golden {} is not JSON: {error}", path.display())),
         ),
-        Err(_) => {
-            println!(
-                "SKIPPED {case}: no golden at {} and WOLFRAMSCRIPT unset (run `just qa-goldens`)",
-                path.display()
-            );
-            None
-        }
+        Err(error) => panic!(
+            "required golden {} is unavailable: {error} (run `just qa-goldens`)",
+            path.display()
+        ),
     }
 }
 
-/// Run a `.wls` script through the live engine; `None` when the engine
-/// binary is missing. Follows the `sonium-qa` invocation pattern,
+/// Run a `.wls` script through the required live engine.
+///
+/// # Panics
+/// Panics if the executable is unavailable, fails, or emits invalid JSON.
+///
+/// Follows the `sonium-qa` invocation pattern,
 /// including the macOS `WolframKernel` fallback. Takes the engine binary
 /// explicitly (no env lookup) so the launch/parse branches are
 /// unit-testable with a fixture script; [`reference`] wires in
@@ -145,10 +154,6 @@ pub fn run_wolfram_script_with(
     }
     let output = match command.output() {
         Ok(output) => output,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("WOLFRAMSCRIPT binary not found; skipping live reference");
-            return None;
-        }
         Err(error) => panic!("failed to launch {executable:?}: {error}"),
     };
     assert!(
@@ -167,6 +172,121 @@ pub fn run_wolfram_script_with(
     }))
 }
 
+/// Hash the paths and values of every numeric tolerance in a reference.
+///
+/// # Errors
+/// Returns an error when an oracle tolerance is not a finite number.
+pub fn allowance_digest(reference: &serde_json::Value) -> Result<String, String> {
+    fn visit(value: &serde_json::Value, path: &str, digest: &mut Sha256) -> Result<(), String> {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut entries: Vec<_> = map.iter().collect();
+                entries.sort_by_key(|(key, _)| *key);
+                for (key, value) in entries {
+                    let path = format!("{path}/{key}");
+                    if key.contains("tolerance") {
+                        let number = value
+                            .as_f64()
+                            .filter(|n| n.is_finite() && *n >= 0.0)
+                            .ok_or_else(|| format!("invalid allowance: {path}"))?;
+                        digest.update(path.as_bytes());
+                        digest.update([0]);
+                        digest.update(number.to_le_bytes());
+                    } else {
+                        visit(value, &path, digest)?;
+                    }
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    visit(value, &format!("{path}/{index}"), digest)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    let mut digest = Sha256::new();
+    visit(reference, "", &mut digest)?;
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+/// Collect raw errors against the manifest's named allowances.
+pub struct NormalizedErrors {
+    allowances: std::collections::BTreeMap<String, f64>,
+    errors: std::collections::BTreeMap<String, f64>,
+}
+
+fn normalized_allowances(
+    case: &toml::Value,
+) -> Result<std::collections::BTreeMap<String, f64>, String> {
+    let table = case
+        .get("allowances")
+        .and_then(toml::Value::as_table)
+        .ok_or("missing normalized allowances")?;
+    if table.is_empty() {
+        return Err("empty normalized allowances".into());
+    }
+    table
+        .iter()
+        .map(|(key, value)| {
+            let value = value
+                .as_float()
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .ok_or("invalid normalized allowance")?;
+            Ok((key.clone(), value))
+        })
+        .collect()
+}
+
+impl NormalizedErrors {
+    /// Create an accumulator using the checked-in manifest.
+    pub fn new(case_id: &str) -> Self {
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../validation-manifest.toml")).expect("valid manifest");
+        let case = manifest["case"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["id"].as_str() == Some(case_id))
+            .expect("manifest case");
+        Self {
+            allowances: normalized_allowances(case).expect("normalized allowances"),
+            errors: Default::default(),
+        }
+    }
+
+    /// Record one raw nonnegative error under its canonical allowance ID.
+    pub fn record(&mut self, id: &str, error: f64) {
+        assert!(self.allowances.contains_key(id), "unknown allowance {id}");
+        assert!(error.is_finite() && error >= 0.0, "invalid error for {id}");
+        self.errors
+            .entry(id.to_owned())
+            .and_modify(|v| *v = v.max(error))
+            .or_insert(error);
+    }
+
+    /// Emit a summary containing raw maxima and their derived ratio.
+    pub fn emit(self, case: &str, reference: &serde_json::Value) {
+        assert_eq!(
+            self.errors.len(),
+            self.allowances.len(),
+            "missing normalized components"
+        );
+        let error = self
+            .errors
+            .iter()
+            .map(|(id, raw)| raw / self.allowances[id])
+            .fold(0.0_f64, f64::max);
+        let result = serde_json::json!({"case": case, "pass": true, "metric": "max_error_over_entry_tolerance", "unit": "ratio", "error": error, "tolerance": 1.0, "allowance_sha256": allowance_digest(reference).expect("numeric oracle allowances"), "provenance": provenance(), "components": self.errors});
+        println!("QA_RESULT: {result}");
+    }
+}
+
 /// Structured pass record printed by every comparison test.
 #[derive(Debug, Clone, Serialize)]
 pub struct QaResult {
@@ -174,10 +294,16 @@ pub struct QaResult {
     pub case: String,
     /// True when the comparison passed.
     pub pass: bool,
-    /// Worst relative error observed.
-    pub max_rel_error: f64,
+    /// Name of the recorded comparison metric.
+    pub metric: String,
+    /// Unit of the recorded error and tolerance.
+    pub unit: String,
+    /// Worst error observed for the named metric.
+    pub error: f64,
     /// Case tolerance from the manifest.
     pub tolerance: f64,
+    /// Digest of the reference's per-entry allowances.
+    pub allowance_sha256: String,
     /// `live-engine` or `checked-in-golden`.
     pub provenance: String,
 }
@@ -188,6 +314,146 @@ pub fn emit_result(result: &QaResult) {
         "QA_RESULT: {}",
         serde_json::to_string(result).unwrap_or_else(|_| "{}".to_string())
     );
+}
+
+/// Verify that every manifest case emitted exactly one successful comparison.
+///
+/// # Errors
+/// Rejects malformed records, missing/duplicate/unknown cases, unsuccessful
+/// comparisons, invalid numeric diagnostics, and unknown reference provenance.
+pub fn verify_result_records(log: &str, manifest: &str) -> Result<usize, String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let manifest: toml::Value = toml::from_str(manifest).map_err(|e| format!("manifest: {e}"))?;
+    let cases = manifest
+        .get("case")
+        .and_then(toml::Value::as_array)
+        .ok_or("manifest has no cases")?;
+    let mut expected = BTreeMap::new();
+    for case in cases {
+        let id = case
+            .get("id")
+            .and_then(toml::Value::as_str)
+            .ok_or("manifest case has no id")?;
+        let metric = case
+            .get("metric")
+            .and_then(toml::Value::as_str)
+            .ok_or("manifest case has no metric")?;
+        let unit = case
+            .get("unit")
+            .and_then(toml::Value::as_str)
+            .ok_or("manifest case has no unit")?;
+        let limit = case
+            .get("limit")
+            .and_then(toml::Value::as_float)
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .ok_or("manifest case has invalid limit")?;
+        let allowance = case
+            .get("allowance_sha256")
+            .and_then(toml::Value::as_str)
+            .filter(|s| s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit()))
+            .ok_or("manifest case has invalid allowance digest")?;
+        if metric.is_empty() || unit.is_empty() {
+            return Err("manifest case has empty metric or unit".into());
+        }
+        if expected
+            .insert(
+                id,
+                (
+                    metric,
+                    unit,
+                    limit,
+                    allowance,
+                    if metric == "max_error_over_entry_tolerance" {
+                        Some(normalized_allowances(case)?)
+                    } else {
+                        None
+                    },
+                ),
+            )
+            .is_some()
+        {
+            return Err(format!("duplicate manifest case: {id}"));
+        }
+    }
+    if expected.is_empty() {
+        return Err("manifest has no cases".into());
+    }
+    let mut seen = BTreeSet::new();
+    for line in log.lines() {
+        let Some((_, payload)) = line.split_once("QA_RESULT: ") else {
+            continue;
+        };
+        let record: serde_json::Value =
+            serde_json::from_str(payload).map_err(|e| format!("QA_RESULT: {e}"))?;
+        let id = record["case"].as_str().ok_or("comparison has no case id")?;
+        let (metric, unit, limit, allowance, components) = expected
+            .get(id)
+            .ok_or_else(|| format!("unknown comparison: {id}"))?;
+        if record["metric"].as_str() != Some(*metric) || record["unit"].as_str() != Some(*unit) {
+            return Err(format!("{id}: wrong or missing metric/unit"));
+        }
+        if record["allowance_sha256"].as_str() != Some(*allowance) {
+            return Err(format!("{id}: reference allowances differ from manifest"));
+        }
+        if !seen.insert(id.to_owned()) {
+            return Err(format!("duplicate comparison: {id}"));
+        }
+        if record["pass"].as_bool() != Some(true) {
+            return Err(format!("failed comparison: {id}"));
+        }
+        let mut numeric = [0.0_f64; 2];
+        for (slot, key) in numeric.iter_mut().zip(["error", "tolerance"]) {
+            let value = record[key]
+                .as_f64()
+                .ok_or_else(|| format!("{id}: invalid {key}"))?;
+            if !value.is_finite() || value < 0.0 {
+                return Err(format!("{id}: invalid {key}"));
+            }
+            *slot = value;
+        }
+        if let Some(allowances) = components {
+            let raw = record["components"]
+                .as_object()
+                .ok_or_else(|| format!("{id}: missing components"))?;
+            if raw.len() != allowances.len() {
+                return Err(format!("{id}: wrong component set"));
+            }
+            let mut ratio = 0.0_f64;
+            for (key, allowance) in allowances {
+                let value = raw
+                    .get(key)
+                    .and_then(serde_json::Value::as_f64)
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .ok_or_else(|| format!("{id}: invalid component {key}"))?;
+                ratio = ratio.max(value / allowance);
+            }
+            if ratio != numeric[0] {
+                return Err(format!("{id}: normalized error does not match components"));
+            }
+        }
+        if numeric[1] != *limit {
+            return Err(format!("{id}: tolerance differs from manifest"));
+        }
+        // A self-reported pass is not evidence: the recorded error must
+        // actually meet the recorded tolerance.
+        if numeric[0] > numeric[1] {
+            return Err(format!(
+                "{id}: error {} exceeds tolerance {}",
+                numeric[0], numeric[1]
+            ));
+        }
+        if !matches!(
+            record["provenance"].as_str(),
+            Some("live-engine" | "checked-in-golden")
+        ) {
+            return Err(format!("{id}: invalid provenance"));
+        }
+    }
+    let missing: Vec<_> = expected.keys().filter(|id| !seen.contains(**id)).collect();
+    if !missing.is_empty() {
+        return Err(format!("missing comparisons: {missing:?}"));
+    }
+    Ok(seen.len())
 }
 
 /// Whether the reference came from the live engine.
@@ -344,13 +610,13 @@ mod tests {
     }
 
     #[test]
-    fn reference_with_reads_golden_and_skips_when_missing() {
+    fn reference_with_reads_golden_and_rejects_missing() {
         let dir = std::env::temp_dir().join("math-qa-reference-with");
         std::fs::create_dir_all(&dir).expect("temp dir");
         std::fs::write(dir.join("present.json"), r#"{"answer": 42.0}"#).expect("fixture");
         let value = reference_with("present", &dir).expect("golden loads");
         assert_eq!(value["answer"], 42.0);
-        assert!(reference_with("absent-case-xyz", &dir).is_none());
+        assert!(std::panic::catch_unwind(|| reference_with("absent-case-xyz", &dir)).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -390,13 +656,13 @@ mod tests {
         let value = run_wolfram_script_with(engine.as_os_str(), "any.wls").expect("parses");
         assert_eq!(value["ok"], true);
         assert_eq!(value["v"], 1.5);
-        // Nonexistent binary -> loud skip, not a panic.
+        // An explicitly selected missing engine must fail the comparison.
         assert!(
-            run_wolfram_script_with(
+            std::panic::catch_unwind(|| run_wolfram_script_with(
                 std::ffi::OsStr::new("/tmp/math-qa-no-such-engine-xyz"),
                 "any.wls"
-            )
-            .is_none()
+            ))
+            .is_err()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -405,17 +671,12 @@ mod tests {
     #[test]
     #[should_panic(expected = "not JSON")]
     fn runner_panics_on_non_json_output() {
-        let dir = std::env::temp_dir().join("math-qa-runner-garbage");
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let path = dir.join("garbage-engine.sh");
-        std::fs::write(&path, "#!/bin/sh\necho 'no json here'\n").expect("fixture");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod fixture");
-        }
-        let _ = run_wolfram_script_with(path.as_os_str(), "any.wls");
+        // `/bin/echo` ignores the `-file <script>` arguments and prints
+        // them back, which is non-JSON stdout with a success status:
+        // exactly the parse-failure branch under test. A freshly written
+        // script fixture is not used because write-then-exec races on
+        // overlay filesystems (transient ETXTBSY on CI runners).
+        let _ = run_wolfram_script_with(std::ffi::OsStr::new("/bin/echo"), "any.wls");
     }
 
     #[cfg(unix)]

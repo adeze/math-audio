@@ -26,6 +26,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   space without allocating in the hot path.
 
 ### Fixed
+- WarpedBiquad uses an equivalent normalized physical-coordinate realization,
+  eliminating extreme-lambda prototype/implicit-solve cancellation. Retain all
+  four allpass histories and map them on retunes and older-state restoration.
+  Matched-peak boost poles are transformed before spectral factoring; a dry-plus-
+  residual form preserves unity endpoints without large numerator cancellation.
+  Parameter/rate changes preserve the implicit history convention, without
+  promising click-free transients. Bilinear-family prewarp/allpass frequency
+  scales cancel exactly; these static physical responses do not gain resolution.
+- Native optimized shelves now select minimum phase for both gain signs and
+  solve their existing endpoint/midpoint constraints without subtractive power
+  cancellation. PeakMatched cuts invert a minimum-phase boost so deep cuts
+  reach requested center gain, with reciprocal phase and continuous zero gain.
+  Existing negative-gain audio intentionally changes; preset names are retained.
+- Correct TPT SVF low/high shelf prewarping and bandpass mix coefficients so
+  gain, corner and user Q match the analog prototypes. Preserve integrator state
+  during parameter updates; shelf audio intentionally changes.
+- Correct the SVF analytic response identity to `input = HP + k*BP + LP`, matching
+  the processing path across filter families. Verify 384 independent analog
+  cases with f64/f32 impulses and 1,920 complex-response probes on four rates.
 - `suppress_pre_ringing` now applies a smooth time-varying cap (audible
   threshold near the main impulse fading cosinusoidally to zero at the
   time limit) instead of blending toward a clamped value; pre-ring energy
@@ -36,6 +55,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   general/symmetric convolution (~87 → ~150 Msamples/s on the filter
   bench); aarch64 NEON 8-output symmetric-FIR block path and unrolled DF1
   scalar path (+12% aggregate throughput, bit-identical checksums).
+
+## [0.5.28] - 2026-10-31
+
+### Changed
+- `FilterFloat` is now sealed to `f32` and `f64`. Downstream crates can
+  no longer implement it for custom numeric types, which keeps
+  primitive-specific SIMD dispatch reachable only with the exact type
+  it was written for. Existing `f32`/`f64` users are unaffected.
+
+## [0.5.27] - 2026-10-18
+
+### Fixed
+- FIR SIMD dispatch checks actual f64 type identity; eight-byte custom numeric
+  types no longer enter f64 pointer casts. AVX2 kernels also require FMA.
+- Custom FIR coefficients require exact symmetry, preserving tiny asymmetric
+  taps and sample/block equivalence. Generated linear-phase taps are explicitly
+  mirrored before normalization.
+
+### Performance and tests
+- FIR `prepare` reserves scratch and reversed taps, preserves them through reset,
+  and chunks oversized callbacks without allocation. General block filtering
+  reuses the available SIMD sample kernel.
+- Added `FiltfiltWorkspace` and `filtfilt_into`; SOS passes reuse one padded buffer.
+- Added precision/symmetry/size allocation and convolution tests, a comprehensive
+  FIR benchmark matrix, and x86 feature combinations with and without FMA.
 
 ## [0.5.23] - 2026-09-09
 

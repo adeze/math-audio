@@ -14,7 +14,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.5.3"
+version = "0.5.5"
 authors = ["Pierre F. Aubert pierre@spinorama.org"]
 description = "Toolkit for audio modelisation"
 edition = "2024"
@@ -70,7 +70,7 @@ math-test-functions = { path = "crates/math-test-functions", version = "0.5", de
 plotly = { version = "0.14.1" }
 
 # Web/WASM
-wasm-bindgen = "=0.2.128"
+wasm-bindgen = "=0.2.130"
 wasm-bindgen-rayon = "1.2"
 
 # Utilities
